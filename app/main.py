@@ -1291,46 +1291,55 @@ def handle_client(client: socket.socket):
                 try:
                     timeout = float(parts[2])
 
+                    should_block = False
+
                     with data_store_lock:
-                        list_value = data_store[key].list_value if key in data_store else None
-                        if list_value is not None and len(list_value) > 0:
-                            element = list_value.pop(0)
-                            response = f"*2\r\n${len(key)}\r\n{key}\r\n${len(element)}\r\n{element}\r\n"
+                        if key in data_store:
+                            stored_value = data_store[key]
+                            if stored_value.list_value is None:
+                                response = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+                            elif len(stored_value.list_value) > 0:
+                                element = stored_value.list_value.pop(0)
+                                response = f"*2\r\n${len(key)}\r\n{key}\r\n${len(element)}\r\n{element}\r\n"
+                            else:
+                                should_block = True
                         else:
-                            # Block and wait
-                            event = threading.Event()
-                            result = []
-                            blocked_client = BlockedClient(
-                                key=key, event=event, result=result)
+                            should_block = True
 
+                    if should_block:
+                        event = threading.Event()
+                        result = []
+                        blocked_client = BlockedClient(
+                            key=key, event=event, result=result)
+
+                        with blocked_clients_lock:
+                            if key not in blocked_clients:
+                                blocked_clients[key] = deque()
+                            blocked_clients[key].append(blocked_client)
+
+                        # Wait with timeout
+                        if timeout > 0:
+                            event.wait(timeout=timeout)
+                        else:
+                            event.wait()
+
+                        if result:
+                            popped_element = result[0]
+                            response = f"*2\r\n${len(key)}\r\n{key}\r\n${len(popped_element)}\r\n{popped_element}\r\n"
+                        else:
+                            # Timeout - remove from queue
                             with blocked_clients_lock:
-                                if key not in blocked_clients:
-                                    blocked_clients[key] = deque()
-                                blocked_clients[key].append(blocked_client)
-
-                            # Wait with timeout
-                            if timeout > 0:
-                                event.wait(timeout=timeout)
-                            else:
-                                event.wait()
-
-                            if result:
-                                popped_element = result[0]
-                                response = f"*2\r\n${len(key)}\r\n{key}\r\n${len(popped_element)}\r\n{popped_element}\r\n"
-                            else:
-                                # Timeout - remove from queue
-                                with blocked_clients_lock:
-                                    if key in blocked_clients:
-                                        try:
-                                            new_queue = deque(
-                                                [bc for bc in blocked_clients[key] if bc != blocked_client])
-                                            if new_queue:
-                                                blocked_clients[key] = new_queue
-                                            else:
-                                                del blocked_clients[key]
-                                        except (KeyError, ValueError):
-                                            pass
-                                response = "*-1\r\n"
+                                if key in blocked_clients:
+                                    try:
+                                        new_queue = deque(
+                                            [bc for bc in blocked_clients[key] if bc != blocked_client])
+                                        if new_queue:
+                                            blocked_clients[key] = new_queue
+                                        else:
+                                            del blocked_clients[key]
+                                    except (KeyError, ValueError):
+                                        pass
+                            response = "*-1\r\n"
                 except ValueError:
                     response = "-ERR timeout is not a float or out of range\r\n"
             # TYPE
