@@ -10,6 +10,8 @@ import time
 import struct
 import base64
 import os
+import hashlib
+import math
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from collections import deque
@@ -87,6 +89,10 @@ master_offset = 0
 
 REPLICATION_ID = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb"
 REPLICATION_OFFSET = 0
+
+# Default user ACL state
+default_user_flags = {"nopass"}
+default_user_passwords: List[str] = []
 
 dir_path = "/tmp/redis-files"
 dbfilename = "dump.rdb"
@@ -223,6 +229,50 @@ def parse_stream_id(id_str: str, is_start: bool) -> Tuple[int, int]:
         seq = int(parts[1])
 
     return (millis, seq)
+
+
+def encode_geohash(longitude: float, latitude: float) -> int:
+    """Encode latitude/longitude into a 52-bit Redis geohash integer score."""
+    norm_lon = (longitude + 180.0) / 360.0
+    norm_lat = (latitude + 85.05112878) / 170.10225756
+
+    lon_bits = int(norm_lon * (1 << 26))
+    lat_bits = int(norm_lat * (1 << 26))
+
+    lon_bits = max(0, min((1 << 26) - 1, lon_bits))
+    lat_bits = max(0, min((1 << 26) - 1, lat_bits))
+
+    result = 0
+    for i in range(26):
+        result |= ((lat_bits >> i) & 1) << (2 * i)
+        result |= ((lon_bits >> i) & 1) << (2 * i + 1)
+
+    return result
+
+
+def decode_geohash(score: int) -> Tuple[float, float]:
+    """Decode a Redis geohash score back to (longitude, latitude)."""
+    lat_bits = 0
+    lon_bits = 0
+    for i in range(26):
+        lat_bits |= ((score >> (2 * i)) & 1) << i
+        lon_bits |= ((score >> (2 * i + 1)) & 1) << i
+
+    lon = (lon_bits + 0.5) / float(1 << 26) * 360.0 - 180.0
+    lat = (lat_bits + 0.5) / float(1 << 26) * 170.10225756 - 85.05112878
+    return lon, lat
+
+
+def geodist_meters(lat1_deg: float, lon1_deg: float, lat2_deg: float, lon2_deg: float) -> float:
+    """Calculate distance in meters between two lat/lon points using Haversine formula."""
+    earth_radius = 6372797.560856
+    lat1 = math.radians(lat1_deg)
+    lat2 = math.radians(lat2_deg)
+    dlat = math.radians(lat2_deg - lat1_deg)
+    dlon = math.radians(lon2_deg - lon1_deg)
+    a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return earth_radius * c
 
 
 def read_length(data: bytes, offset: int) -> Tuple[int, int]:
@@ -614,6 +664,158 @@ def execute_command(parts: List[str]) -> str:
                         response = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
         except ValueError:
             response = "-ERR value is not a valid float\r\n"
+    elif command == "GEOADD" and len(parts) >= 5:
+        try:
+            lon = float(parts[2])
+            lat = float(parts[3])
+        except ValueError:
+            return "-ERR invalid longitude,latitude pair\r\n"
+
+        if lon < -180.0 or lon > 180.0:
+            return f"-ERR invalid longitude value {lon:.6f}\r\n"
+        if lat < -85.05112878 or lat > 85.05112878:
+            return f"-ERR invalid latitude value {lat:.6f}\r\n"
+
+        key = parts[1]
+        member = parts[4]
+        score = float(encode_geohash(lon, lat))
+
+        with data_store_lock:
+            if key not in data_store:
+                data_store[key] = StoredValue(sorted_set=[SortedSetEntry(member=member, score=score)])
+                response = ":1\r\n"
+            else:
+                stored_value = data_store[key]
+                if stored_value.sorted_set is None:
+                    response = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+                else:
+                    existing_entry = next((e for e in stored_value.sorted_set if e.member == member), None)
+                    if existing_entry:
+                        stored_value.sorted_set.remove(existing_entry)
+                        stored_value.sorted_set.append(SortedSetEntry(member=member, score=score))
+                        stored_value.sorted_set.sort()
+                        response = ":0\r\n"
+                    else:
+                        stored_value.sorted_set.append(SortedSetEntry(member=member, score=score))
+                        stored_value.sorted_set.sort()
+                        response = ":1\r\n"
+    elif command == "GEOPOS" and len(parts) >= 3:
+        key = parts[1]
+        member_count = len(parts) - 2
+        result_parts = [f"*{member_count}\r\n"]
+
+        with data_store_lock:
+            stored_value = data_store.get(key)
+            sorted_set = stored_value.sorted_set if stored_value is not None else None
+
+            for member in parts[2:]:
+                found = False
+                if sorted_set is not None:
+                    entry = next((e for e in sorted_set if e.member == member), None)
+                    if entry:
+                        dec_lon, dec_lat = decode_geohash(int(entry.score))
+                        lon_str = format(dec_lon, ".17g")
+                        lat_str = format(dec_lat, ".17g")
+                        result_parts.append(f"*2\r\n${len(lon_str)}\r\n{lon_str}\r\n${len(lat_str)}\r\n{lat_str}\r\n")
+                        found = True
+                if not found:
+                    result_parts.append("*-1\r\n")
+
+        response = "".join(result_parts)
+    elif command == "GEODIST" and len(parts) >= 4:
+        key = parts[1]
+        member1 = parts[2]
+        member2 = parts[3]
+
+        with data_store_lock:
+            stored_value = data_store.get(key)
+            if stored_value is None or stored_value.sorted_set is None:
+                response = "$-1\r\n"
+            else:
+                e1 = next((e for e in stored_value.sorted_set if e.member == member1), None)
+                e2 = next((e for e in stored_value.sorted_set if e.member == member2), None)
+                if e1 is None or e2 is None:
+                    response = "$-1\r\n"
+                else:
+                    lon1, lat1 = decode_geohash(int(e1.score))
+                    lon2, lat2 = decode_geohash(int(e2.score))
+                    dist = geodist_meters(lat1, lon1, lat2, lon2)
+                    dist_str = format(dist, ".4f")
+                    response = f"${len(dist_str)}\r\n{dist_str}\r\n"
+    elif command == "GEOSEARCH" and len(parts) >= 8:
+        key = parts[1]
+        if parts[2].upper() != "FROMLONLAT" or parts[5].upper() != "BYRADIUS":
+            response = "-ERR unsupported GEOSEARCH options\r\n"
+        else:
+            try:
+                center_lon = float(parts[3])
+                center_lat = float(parts[4])
+                radius = float(parts[6])
+            except ValueError:
+                return "-ERR invalid arguments\r\n"
+
+            unit_multiplier = {
+                "km": 1000.0,
+                "mi": 1609.344,
+                "ft": 0.3048,
+            }.get(parts[7].lower(), 1.0)
+            radius_meters = radius * unit_multiplier
+
+            matches: List[str] = []
+            with data_store_lock:
+                stored_value = data_store.get(key)
+                if stored_value is not None and stored_value.sorted_set is not None:
+                    for entry in stored_value.sorted_set:
+                        member_lon, member_lat = decode_geohash(int(entry.score))
+                        dist = geodist_meters(center_lat, center_lon, member_lat, member_lon)
+                        if dist <= radius_meters:
+                            matches.append(entry.member)
+
+            result_parts = [f"*{len(matches)}\r\n"]
+            for member in matches:
+                result_parts.append(f"${len(member)}\r\n{member}\r\n")
+            response = "".join(result_parts)
+    elif command == "AUTH" and len(parts) >= 3:
+        username = parts[1]
+        password = parts[2]
+        if username != "default":
+            response = "-WRONGPASS invalid username-password pair or user is disabled.\r\n"
+        elif "nopass" in default_user_flags:
+            response = "+OK\r\n"
+        else:
+            password_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
+            if password_hash in default_user_passwords:
+                response = "+OK\r\n"
+            else:
+                response = "-WRONGPASS invalid username-password pair or user is disabled.\r\n"
+    elif command == "ACL" and len(parts) >= 2 and parts[1].upper() == "WHOAMI":
+        response = "$7\r\ndefault\r\n"
+    elif command == "ACL" and len(parts) >= 3 and parts[1].upper() == "SETUSER":
+        username = parts[2]
+        if username != "default":
+            response = "-ERR unknown user\r\n"
+        else:
+            for rule in parts[3:]:
+                if rule.startswith(">"):
+                    password_hash = hashlib.sha256(rule[1:].encode("utf-8")).hexdigest()
+                    if password_hash not in default_user_passwords:
+                        default_user_passwords.append(password_hash)
+                    default_user_flags.discard("nopass")
+            response = "+OK\r\n"
+    elif command == "ACL" and len(parts) >= 3 and parts[1].upper() == "GETUSER":
+        username = parts[2]
+        if username != "default":
+            response = "$-1\r\n"
+        else:
+            flags_list = list(default_user_flags)
+            result_parts = ["*4\r\n", "$5\r\nflags\r\n", f"*{len(flags_list)}\r\n"]
+            for flag in flags_list:
+                result_parts.append(f"${len(flag)}\r\n{flag}\r\n")
+            result_parts.append("$9\r\npasswords\r\n")
+            result_parts.append(f"*{len(default_user_passwords)}\r\n")
+            for password_hash in default_user_passwords:
+                result_parts.append(f"${len(password_hash)}\r\n{password_hash}\r\n")
+            response = "".join(result_parts)
     elif command == "ZRANK" and len(parts) >= 3:
         key = parts[1]
         member = parts[2]
@@ -938,6 +1140,7 @@ def handle_client(client: socket.socket):
     transaction_queue = []
     is_replication_connection = False
     is_subscribed_mode = False
+    is_authenticated = "nopass" in default_user_flags
 
     while True:
         try:
@@ -964,6 +1167,12 @@ def handle_client(client: socket.socket):
                     response = f"-ERR Can't execute '{command.lower()}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context\r\n"
                     client.send(response.encode('utf-8'))
                     continue
+
+            # Check authentication before processing commands
+            if not is_authenticated and command not in ["AUTH", "HELLO", "QUIT", "RESET"]:
+                response = "-NOAUTH Authentication required.\r\n"
+                client.send(response.encode('utf-8'))
+                continue
 
             # MULTI, EXEC, DISCARD
             if command == "MULTI":
@@ -1002,6 +1211,52 @@ def handle_client(client: socket.socket):
             elif command == "ECHO" and len(parts) > 1:
                 message = parts[1]
                 response = f"${len(message)}\r\n{message}\r\n"
+            # AUTH
+            elif command == "AUTH" and len(parts) >= 3:
+                username = parts[1]
+                password = parts[2]
+                if username == "default":
+                    if "nopass" in default_user_flags:
+                        is_authenticated = True
+                        response = "+OK\r\n"
+                    else:
+                        password_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
+                        if password_hash in default_user_passwords:
+                            is_authenticated = True
+                            response = "+OK\r\n"
+                        else:
+                            response = "-WRONGPASS invalid username-password pair or user is disabled.\r\n"
+                else:
+                    response = "-WRONGPASS invalid username-password pair or user is disabled.\r\n"
+            # ACL WHOAMI / SETUSER / GETUSER
+            elif command == "ACL" and len(parts) >= 2 and parts[1].upper() == "WHOAMI":
+                response = "$7\r\ndefault\r\n"
+            elif command == "ACL" and len(parts) >= 3 and parts[1].upper() == "SETUSER":
+                username = parts[2]
+                if username != "default":
+                    response = "-ERR unknown user\r\n"
+                else:
+                    for rule in parts[3:]:
+                        if rule.startswith(">"):
+                            password_hash = hashlib.sha256(rule[1:].encode("utf-8")).hexdigest()
+                            if password_hash not in default_user_passwords:
+                                default_user_passwords.append(password_hash)
+                            default_user_flags.discard("nopass")
+                    response = "+OK\r\n"
+            elif command == "ACL" and len(parts) >= 3 and parts[1].upper() == "GETUSER":
+                username = parts[2]
+                if username != "default":
+                    response = "$-1\r\n"
+                else:
+                    flags_list = list(default_user_flags)
+                    response_parts = ["*4\r\n", "$5\r\nflags\r\n", f"*{len(flags_list)}\r\n"]
+                    for flag in flags_list:
+                        response_parts.append(f"${len(flag)}\r\n{flag}\r\n")
+                    response_parts.append("$9\r\npasswords\r\n")
+                    response_parts.append(f"*{len(default_user_passwords)}\r\n")
+                    for password_hash in default_user_passwords:
+                        response_parts.append(f"${len(password_hash)}\r\n{password_hash}\r\n")
+                    response = "".join(response_parts)
             # INFO
             elif command == "INFO":
                 is_replica = 'master_host' in globals() and globals().get('master_host') is not None
@@ -1143,8 +1398,8 @@ def handle_client(client: socket.socket):
                     else:
                         data_store[key] = StoredValue(value="1")
                         response = ":1\r\n"
-            # Sorted sets - ZADD, ZRANK, ZRANGE, ZCARD, ZSCORE, ZREM (implemented via execute_command)
-            elif command in ["ZADD", "ZRANK", "ZRANGE", "ZCARD", "ZSCORE", "ZREM"]:
+            # Sorted sets and geospatials (implemented via execute_command)
+            elif command in ["ZADD", "ZRANK", "ZRANGE", "ZCARD", "ZSCORE", "ZREM", "GEOADD", "GEOPOS", "GEODIST", "GEOSEARCH"]:
                 response = execute_command(parts)
             # Lists - RPUSH, LPUSH, LRANGE, LLEN, LPOP, BLPOP
             elif command == "RPUSH" and len(parts) >= 3:
@@ -1361,6 +1616,8 @@ def handle_client(client: socket.socket):
                             response = "+list\r\n"
                         elif stored_value.stream is not None:
                             response = "+stream\r\n"
+                        elif stored_value.sorted_set is not None:
+                            response = "+zset\r\n"
                         else:
                             response = "+none\r\n"
             # WAIT
