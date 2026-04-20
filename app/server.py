@@ -498,11 +498,15 @@ def main() -> None:
         aof_dir = os.path.join(dir_path, appenddirname)
         os.makedirs(aof_dir, exist_ok=True)
         incr_aof = os.path.join(aof_dir, f"{appendfilename}.1.incr.aof")
+        manifest_path = os.path.join(aof_dir, f"{appendfilename}.manifest")
         state.aof_file_path = incr_aof
         if os.path.exists(incr_aof):
             replay_aof(incr_aof)
         else:
             open(incr_aof, "ab").close()
+        if not os.path.exists(manifest_path):
+            with open(manifest_path, "w") as mf:
+                mf.write(f"file {appendfilename}.1.incr.aof seq 1 type i\n")
 
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
