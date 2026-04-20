@@ -28,10 +28,10 @@ def parse_args() -> Tuple[int, Optional[str], Optional[int], str, str, str, str,
     port = 6379
     master_host: Optional[str] = None
     master_port: Optional[int] = None
-    dir_path = "/tmp/redis-files"
+    dir_path = "/app"
     dbfilename = "dump.rdb"
     appendonly = "no"
-    appenddirname = "/tmp/redis-files"
+    appenddirname = "appendonlydir"
     appendfilename = "appendonly.aof"
     appendfsync = "everysec"
 
