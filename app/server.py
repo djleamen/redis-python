@@ -497,10 +497,10 @@ def main() -> None:
     if appendonly.lower() == "yes":
         aof_dir = os.path.join(dir_path, appenddirname)
         os.makedirs(aof_dir, exist_ok=True)
-        aof_path = os.path.join(aof_dir, appendfilename)
-        state.aof_file_path = aof_path
-        if os.path.exists(aof_path):
-            replay_aof(aof_path)
+        incr_aof = os.path.join(aof_dir, f"{appendfilename}.1.incr.aof")
+        state.aof_file_path = incr_aof
+        if os.path.exists(incr_aof):
+            replay_aof(incr_aof)
 
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
