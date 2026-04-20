@@ -501,6 +501,8 @@ def main() -> None:
         state.aof_file_path = incr_aof
         if os.path.exists(incr_aof):
             replay_aof(incr_aof)
+        else:
+            open(incr_aof, "ab").close()
 
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
