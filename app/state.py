@@ -63,6 +63,24 @@ default_user_flags: Set[str] = {"nopass"}
 default_user_passwords: List[str] = []
 
 # ---------------------------------------------------------------------------
+# Watch state for WATCH/UNWATCH/MULTI/EXEC transactions
+# ---------------------------------------------------------------------------
+
+key_watchers: Dict[str, Set[socket.socket]] = {}
+watch_dirty: Dict[socket.socket, bool] = {}
+watch_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# Append-only file (AOF) configuration
+# ---------------------------------------------------------------------------
+
+appendonly: str = "no"
+appenddirname: str = "/tmp/redis-files"
+appendfilename: str = "appendonly.aof"
+appendfsync: str = "everysec"
+aof_file_path: Optional[str] = None
+
+# ---------------------------------------------------------------------------
 # Server configuration (populated at startup via parse_args)
 # ---------------------------------------------------------------------------
 

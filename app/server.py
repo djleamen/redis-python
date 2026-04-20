@@ -14,7 +14,7 @@ from . import state
 from .blocking import unblock_waiting_clients, unblock_waiting_stream_readers
 from .commands import execute_command
 from .models import BlockedClient, BlockedStreamReader, StoredValue, StreamEntry
-from .protocol import parse_resp_array, parse_stream_id
+from .protocol import parse_resp_array, parse_stream_id, try_parse_resp_command
 from .rdb import load_rdb_file
 from .replication import (
     build_fullresync_payload,
@@ -51,6 +51,89 @@ def _build_stream_resp(
     return "".join(resp)
 
 
+# ---------------------------------------------------------------------------
+# WATCH / AOF helpers
+# ---------------------------------------------------------------------------
+
+
+def _notify_key_modified(key: str, modifier: socket.socket) -> None:
+    """
+    Mark all clients watching *key* (other than *modifier*) as dirty so that
+    their pending EXEC will be aborted.
+
+    :param key: The key that was just written.
+    :param modifier: The client performing the write (not marked dirty).
+    """
+    with state.watch_lock:
+        watchers = state.key_watchers.get(key)
+        if watchers:
+            for watcher in watchers:
+                if watcher is not modifier:
+                    state.watch_dirty[watcher] = True
+
+
+def _clear_watch_state(client: socket.socket, watched_keys: set) -> None:
+    """
+    Remove *client* from all key-watcher sets and clear its dirty flag.
+
+    :param client: The client whose watch state should be removed.
+    :param watched_keys: The set of keys this client is currently watching
+        (will be cleared in-place).
+    """
+    with state.watch_lock:
+        for key in watched_keys:
+            watchers = state.key_watchers.get(key)
+            if watchers:
+                watchers.discard(client)
+                if not watchers:
+                    del state.key_watchers[key]
+        state.watch_dirty.pop(client, None)
+    watched_keys.clear()
+
+
+def _append_to_aof(parts: List[str]) -> None:
+    """
+    Append a command to the AOF file in RESP format.
+
+    Does nothing when AOF is not enabled (``state.aof_file_path`` is ``None``).
+
+    :param parts: Parsed command tokens to persist.
+    """
+    if state.aof_file_path is None:
+        return
+    resp_parts = [f"*{len(parts)}\r\n"]
+    for part in parts:
+        resp_parts.append(f"${len(part)}\r\n{part}\r\n")
+    data = "".join(resp_parts).encode("utf-8")
+    with open(state.aof_file_path, "ab") as f:
+        f.write(data)
+        if state.appendfsync.lower() == "always":
+            f.flush()
+            os.fsync(f.fileno())
+
+
+def _replay_aof(path: str) -> None:
+    """
+    Re-execute all commands stored in the AOF file to restore state on startup.
+
+    :param path: Filesystem path to the AOF file.
+    """
+    try:
+        with open(path, "rb") as f:
+            raw = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return
+    offset = 0
+    while offset < len(raw):
+        cmd_parts, consumed = try_parse_resp_command(raw[offset:])
+        if consumed == 0:
+            break
+        offset += consumed
+        if cmd_parts:
+            from .commands import execute_command
+            execute_command(cmd_parts)
+
+
 def handle_client(client: socket.socket) -> None:
     """
     Manage the full lifecycle of a single client connection.
@@ -63,6 +146,7 @@ def handle_client(client: socket.socket) -> None:
     """
     in_transaction = False
     transaction_queue: List[List[str]] = []
+    watched_keys: set = set()
     is_replication_connection = False
     is_subscribed_mode = False
     is_authenticated = "nopass" in state.default_user_flags
@@ -109,11 +193,20 @@ def handle_client(client: socket.socket) -> None:
 
             elif command == "EXEC":
                 if in_transaction:
-                    responses = [execute_command(cmd)
-                                 for cmd in transaction_queue]
-                    response = f"*{len(responses)}\r\n" + "".join(responses)
+                    if state.watch_dirty.get(client, False):
+                        response = "*-1\r\n"
+                    else:
+                        _write_cmds = {"SET", "INCR", "ZADD", "ZREM", "GEOADD", "XADD", "RPUSH", "LPUSH"}
+                        responses = []
+                        for cmd in transaction_queue:
+                            r = execute_command(cmd)
+                            responses.append(r)
+                            if cmd and len(cmd) >= 2 and cmd[0].upper() in _write_cmds:
+                                _notify_key_modified(cmd[1], client)
+                        response = f"*{len(responses)}\r\n" + "".join(responses)
                     in_transaction = False
                     transaction_queue = []
+                    _clear_watch_state(client, watched_keys)
                 else:
                     response = "-ERR EXEC without MULTI\r\n"
 
@@ -121,9 +214,24 @@ def handle_client(client: socket.socket) -> None:
                 if in_transaction:
                     in_transaction = False
                     transaction_queue = []
+                    _clear_watch_state(client, watched_keys)
                     response = "+OK\r\n"
                 else:
                     response = "-ERR DISCARD without MULTI\r\n"
+
+            elif command == "WATCH" and len(parts) >= 2:
+                if in_transaction:
+                    response = "-ERR WATCH inside MULTI is not allowed\r\n"
+                else:
+                    with state.watch_lock:
+                        for key in parts[1:]:
+                            state.key_watchers.setdefault(key, set()).add(client)
+                            watched_keys.add(key)
+                    response = "+OK\r\n"
+
+            elif command == "UNWATCH":
+                _clear_watch_state(client, watched_keys)
+                response = "+OK\r\n"
 
             elif in_transaction:
                 transaction_queue.append(parts)
@@ -180,7 +288,15 @@ def handle_client(client: socket.socket) -> None:
                     value = state.dir_path
                 elif parameter == "dbfilename":
                     value = state.dbfilename
-                if value:
+                elif parameter == "appendonly":
+                    value = state.appendonly
+                elif parameter == "appenddirname":
+                    value = state.appenddirname
+                elif parameter == "appendfilename":
+                    value = state.appendfilename
+                elif parameter == "appendfsync":
+                    value = state.appendfsync
+                if value is not None:
                     response = (
                         f"*2\r\n${len(parameter)}\r\n{parameter}\r\n"
                         f"${len(value)}\r\n{value}\r\n"
@@ -231,6 +347,9 @@ def handle_client(client: socket.socket) -> None:
                 response = execute_command(parts)
                 if not is_replication_connection:
                     propagate_to_replicas(input_str)
+                    _notify_key_modified(parts[1], client)
+                    if state.appendonly.lower() == "yes":
+                        _append_to_aof(parts)
 
             # ------------------------------------------------------------------
             # Stateless commands — delegate to execute_command
@@ -242,6 +361,8 @@ def handle_client(client: socket.socket) -> None:
                 "GEOADD", "GEOPOS", "GEODIST", "GEOSEARCH",
             }:
                 response = execute_command(parts)
+                if command in {"INCR", "ZADD", "ZREM", "GEOADD"} and len(parts) >= 2:
+                    _notify_key_modified(parts[1], client)
 
             # ------------------------------------------------------------------
             # List commands
@@ -253,6 +374,7 @@ def handle_client(client: socket.socket) -> None:
                     response = ""
                 if should_unblock:
                     unblock_waiting_clients(parts[1])
+                _notify_key_modified(parts[1], client)
 
             elif command == "LPUSH" and len(parts) >= 3:
                 response, should_unblock = _cmd_lpush(parts)
@@ -261,6 +383,7 @@ def handle_client(client: socket.socket) -> None:
                     response = ""
                 if should_unblock:
                     unblock_waiting_clients(parts[1])
+                _notify_key_modified(parts[1], client)
 
             elif command == "LRANGE" and len(parts) >= 4:
                 response = _cmd_lrange(parts)
@@ -309,6 +432,8 @@ def handle_client(client: socket.socket) -> None:
             # ------------------------------------------------------------------
             elif command == "XADD" and len(parts) >= 4:
                 response = _cmd_xadd(parts)
+                if not response.startswith("-"):
+                    _notify_key_modified(parts[1], client)
 
             elif command == "XREAD" and len(parts) >= 4:
                 response = _cmd_xread(client, parts)
@@ -340,6 +465,9 @@ def handle_client(client: socket.socket) -> None:
                     if not state.channel_subscribers[channel]:
                         del state.channel_subscribers[channel]
             del state.client_subscriptions[client]
+
+    # Cleanup watch state
+    _clear_watch_state(client, watched_keys)
 
     client.close()
 
@@ -937,13 +1065,24 @@ def main() -> None:
     Start the Redis server, load persisted data, and accept client connections.
     """
 
-    port, master_host, master_port, dir_path, dbfilename = parse_args()
+    port, master_host, master_port, dir_path, dbfilename, appendonly, appenddirname, appendfilename, appendfsync = parse_args()
 
     state.dir_path = dir_path
     state.dbfilename = dbfilename
     state.master_host = master_host
+    state.appendonly = appendonly
+    state.appenddirname = appenddirname
+    state.appendfilename = appendfilename
+    state.appendfsync = appendfsync
 
     load_rdb_file(os.path.join(dir_path, dbfilename))
+
+    if appendonly.lower() == "yes":
+        os.makedirs(appenddirname, exist_ok=True)
+        aof_path = os.path.join(appenddirname, appendfilename)
+        state.aof_file_path = aof_path
+        if os.path.exists(aof_path):
+            _replay_aof(aof_path)
 
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
