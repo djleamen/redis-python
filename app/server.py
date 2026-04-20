@@ -495,8 +495,9 @@ def main() -> None:
     load_rdb_file(os.path.join(dir_path, dbfilename))
 
     if appendonly.lower() == "yes":
-        os.makedirs(appenddirname, exist_ok=True)
-        aof_path = os.path.join(appenddirname, appendfilename)
+        aof_dir = os.path.join(dir_path, appenddirname)
+        os.makedirs(aof_dir, exist_ok=True)
+        aof_path = os.path.join(aof_dir, appendfilename)
         state.aof_file_path = aof_path
         if os.path.exists(aof_path):
             replay_aof(aof_path)
