@@ -500,11 +500,22 @@ def main() -> None:
         incr_aof = os.path.join(aof_dir, f"{appendfilename}.1.incr.aof")
         manifest_path = os.path.join(aof_dir, f"{appendfilename}.manifest")
         state.aof_file_path = incr_aof
-        if os.path.exists(incr_aof):
-            replay_aof(incr_aof)
+        if os.path.exists(manifest_path):
+            # Parse manifest and replay each listed file in order
+            with open(manifest_path, "r") as mf:
+                for line in mf:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    parts = line.split()
+                    # Format: file <filename> seq <n> type <t>
+                    if len(parts) >= 2 and parts[0] == "file":
+                        entry_path = os.path.join(aof_dir, parts[1])
+                        if os.path.exists(entry_path):
+                            replay_aof(entry_path)
         else:
-            open(incr_aof, "ab").close()
-        if not os.path.exists(manifest_path):
+            if not os.path.exists(incr_aof):
+                open(incr_aof, "ab").close()
             with open(manifest_path, "w") as mf:
                 mf.write(f"file {appendfilename}.1.incr.aof seq 1 type i\n")
 
