@@ -88,13 +88,13 @@ def _clear_watch_state(client: socket.socket, watched_keys: set) -> None:
     watched_keys.clear()
 
 
-def _handle_multi(ctx: "_ClientCtx", parts: List[str]) -> str:
+def _handle_multi(ctx: "_ClientCtx") -> str:
     ctx.in_transaction = True
     ctx.transaction_queue = []
     return "+OK\r\n"
 
 
-def _handle_exec(ctx: "_ClientCtx", parts: List[str]) -> str:
+def _handle_exec(ctx: "_ClientCtx") -> str:
     if not ctx.in_transaction:
         return "-ERR EXEC without MULTI\r\n"
     if state.watch_dirty.get(ctx.client, False):
@@ -113,7 +113,7 @@ def _handle_exec(ctx: "_ClientCtx", parts: List[str]) -> str:
     return response
 
 
-def _handle_discard(ctx: "_ClientCtx", parts: List[str]) -> str:
+def _handle_discard(ctx: "_ClientCtx") -> str:
     if not ctx.in_transaction:
         return "-ERR DISCARD without MULTI\r\n"
     ctx.in_transaction = False
@@ -146,7 +146,7 @@ def _handle_auth(ctx: "_ClientCtx", parts: List[str]) -> str:
     return _WRONGPASS
 
 
-def _handle_info(ctx: "_ClientCtx", parts: List[str]) -> str:
+def _handle_info(parts: List[str]) -> str:
     is_replica = state.master_host is not None
     role = "slave" if is_replica else "master"
     if len(parts) == 1 or parts[1].upper() == "REPLICATION":
@@ -162,7 +162,7 @@ def _handle_info(ctx: "_ClientCtx", parts: List[str]) -> str:
     return "$0\r\n\r\n"
 
 
-def _handle_config_get(ctx: "_ClientCtx", parts: List[str]) -> str:
+def _handle_config_get(parts: List[str]) -> str:
     parameter = parts[2].lower()
     _config_map = {
         "dir": state.dir_path,
@@ -181,7 +181,7 @@ def _handle_config_get(ctx: "_ClientCtx", parts: List[str]) -> str:
     return "*0\r\n"
 
 
-def _handle_keys(ctx: "_ClientCtx", parts: List[str]) -> str:
+def _handle_keys(parts: List[str]) -> str:
     pattern = parts[1]
     with state.data_store_lock:
         matching = [
@@ -213,11 +213,11 @@ def _dispatch_command(ctx: "_ClientCtx", parts: List[str], input_str: str) -> st
     command = parts[0].upper()
 
     if command == "MULTI":
-        return _handle_multi(ctx, parts)
+        return _handle_multi(ctx)
     if command == "EXEC":
-        return _handle_exec(ctx, parts)
+        return _handle_exec(ctx)
     if command == "DISCARD":
-        return _handle_discard(ctx, parts)
+        return _handle_discard(ctx)
     if command == "WATCH" and len(parts) >= 2:
         return _handle_watch(ctx, parts)
     if command == "UNWATCH":
@@ -231,11 +231,11 @@ def _dispatch_command(ctx: "_ClientCtx", parts: List[str], input_str: str) -> st
     if command == "AUTH" and len(parts) >= 3:
         return _handle_auth(ctx, parts)
     if command == "INFO":
-        return _handle_info(ctx, parts)
+        return _handle_info(parts)
     if command == "CONFIG" and len(parts) >= 3 and parts[1].upper() == "GET":
-        return _handle_config_get(ctx, parts)
+        return _handle_config_get(parts)
     if command == "KEYS" and len(parts) >= 2:
-        return _handle_keys(ctx, parts)
+        return _handle_keys(parts)
     if command == "REPLCONF":
         return _handle_replconf(ctx, parts)
     if command == "PSYNC" and len(parts) >= 3:
