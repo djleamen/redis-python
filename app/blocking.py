@@ -28,6 +28,22 @@ def unblock_waiting_clients(key: str) -> None:
                     break
 
 
+def _get_stream_entries_after(stream_key: str, start_id: str) -> list:
+    """Return entries in *stream_key* whose ID is strictly greater than *start_id*."""
+    with state.data_store_lock:
+        stored = state.data_store.get(stream_key)
+        if stored is None or stored.stream is None:
+            return []
+        start_ms, start_seq = parse_stream_id(start_id, True)
+        matches = []
+        for entry in stored.stream:
+            id_parts = entry.id.split("-")
+            em, es = int(id_parts[0]), int(id_parts[1])
+            if (em, es) > (start_ms, start_seq):
+                matches.append(entry)
+        return matches
+
+
 def unblock_waiting_stream_readers(key: str) -> None:
     """
     Notify all ``XREAD BLOCK`` clients waiting on *key* that new entries exist.
@@ -44,18 +60,7 @@ def unblock_waiting_stream_readers(key: str) -> None:
     for reader in readers:
         results = []
         for i, stream_key in enumerate(reader.keys):
-            start_id = reader.ids[i]
-            with state.data_store_lock:
-                stored = state.data_store.get(stream_key)
-                if stored is None or stored.stream is None:
-                    continue
-                start_ms, start_seq = parse_stream_id(start_id, True)
-                matches = []
-                for entry in stored.stream:
-                    id_parts = entry.id.split("-")
-                    em, es = int(id_parts[0]), int(id_parts[1])
-                    if (em, es) > (start_ms, start_seq):
-                        matches.append(entry)
+            matches = _get_stream_entries_after(stream_key, reader.ids[i])
             if matches:
                 results.append((stream_key, matches))
 
