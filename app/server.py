@@ -348,6 +348,55 @@ def _dispatch_command(ctx: "_ClientCtx", parts: List[str], input_str: str) -> st
     return "-ERR unknown command\r\n"
 
 
+def _process_client_message(ctx: "_ClientCtx", buf: bytes) -> bool:
+    """
+    Parse and dispatch one message buffer from a client.
+
+    :returns: False if the connection should be closed, True otherwise.
+    """
+    if not buf:
+        return False
+    input_str = buf.decode("utf-8")
+    parts = parse_resp_array(input_str)
+    if not parts:
+        return True
+    command = parts[0].upper()
+    if ctx.is_subscribed_mode and command not in _SUBSCRIBED_ALLOWED:
+        ctx.client.send(
+            f"-ERR Can't execute '{command.lower()}': only (P|S)SUBSCRIBE / "
+            f"(P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed "
+            f"in this context\r\n".encode("utf-8")
+        )
+        return True
+    if not ctx.is_authenticated and command not in {"AUTH", "HELLO", "QUIT", "RESET"}:
+        ctx.client.send(b"-NOAUTH Authentication required.\r\n")
+        return True
+    response = _dispatch_command(ctx, parts, input_str)
+    if response and not ctx.is_replication_connection:
+        ctx.client.send(response.encode("utf-8"))
+    return True
+
+
+def _cleanup_client(client: socket.socket, ctx: "_ClientCtx") -> None:
+    """Remove all server-side state associated with a disconnected client."""
+    with state.replica_connections_lock:
+        if client in state.replica_connections:
+            state.replica_connections.remove(client)
+        state.replica_ack_offsets.pop(client, None)
+
+    with state.subscriptions_lock:
+        if client in state.client_subscriptions:
+            for channel in state.client_subscriptions[client]:
+                if channel in state.channel_subscribers:
+                    state.channel_subscribers[channel].discard(client)
+                    if not state.channel_subscribers[channel]:
+                        del state.channel_subscribers[channel]
+            del state.client_subscriptions[client]
+
+    _clear_watch_state(client, ctx.watched_keys)
+    client.close()
+
+
 def handle_client(client: socket.socket) -> None:
     """
     Manage the full lifecycle of a single client connection.
@@ -359,53 +408,12 @@ def handle_client(client: socket.socket) -> None:
     while True:
         try:
             buf = client.recv(1024)
-            if not buf:
+            if not _process_client_message(ctx, buf):
                 break
-            input_str = buf.decode("utf-8")
-            parts = parse_resp_array(input_str)
-            if not parts:
-                continue
-            command = parts[0].upper()
-
-            if ctx.is_subscribed_mode and command not in _SUBSCRIBED_ALLOWED:
-                client.send(
-                    f"-ERR Can't execute '{command.lower()}': only (P|S)SUBSCRIBE / "
-                    f"(P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed "
-                    f"in this context\r\n".encode("utf-8")
-                )
-                continue
-
-            if not ctx.is_authenticated and command not in {"AUTH", "HELLO", "QUIT", "RESET"}:
-                client.send(b"-NOAUTH Authentication required.\r\n")
-                continue
-
-            response = _dispatch_command(ctx, parts, input_str)
-            if response and not ctx.is_replication_connection:
-                client.send(response.encode("utf-8"))
-
         except OSError:
             break
 
-    # Cleanup replica state
-    with state.replica_connections_lock:
-        if client in state.replica_connections:
-            state.replica_connections.remove(client)
-        state.replica_ack_offsets.pop(client, None)
-
-    # Cleanup subscription state
-    with state.subscriptions_lock:
-        if client in state.client_subscriptions:
-            for channel in state.client_subscriptions[client]:
-                if channel in state.channel_subscribers:
-                    state.channel_subscribers[channel].discard(client)
-                    if not state.channel_subscribers[channel]:
-                        del state.channel_subscribers[channel]
-            del state.client_subscriptions[client]
-
-    # Cleanup watch state
-    _clear_watch_state(client, ctx.watched_keys)
-
-    client.close()
+    _cleanup_client(client, ctx)
 
 
 def _cmd_type(parts: List[str]) -> str:
@@ -413,7 +421,8 @@ def _cmd_type(parts: List[str]) -> str:
     Handle the TYPE command.
 
     :param parts: Parsed RESP command tokens.
-    :returns: RESP-encoded type string (``+string``, ``+list``, ``+stream``, ``+zset``, or ``+none``).
+    :returns: RESP-encoded type string (``+string``, ``+list``, ``+stream``, 
+    ``+zset``, or ``+none``).
     """
     key = parts[1]
     with state.data_store_lock:
