@@ -39,11 +39,6 @@ def execute_command(parts: List[str]) -> str:
     return handler(parts)
 
 
-# ---------------------------------------------------------------------------
-# String commands
-# ---------------------------------------------------------------------------
-
-
 def _cmd_set(parts: List[str]) -> str:
     """
     Handle the SET command.
@@ -117,11 +112,6 @@ def _cmd_incr(parts: List[str]) -> str:
             return "-ERR value is not an integer or out of range\r\n"
 
 
-# ---------------------------------------------------------------------------
-# Auth / ACL commands
-# ---------------------------------------------------------------------------
-
-
 def _cmd_auth(parts: List[str]) -> str:
     """
     Handle the AUTH command.
@@ -140,6 +130,36 @@ def _cmd_auth(parts: List[str]) -> str:
     return "-WRONGPASS invalid username-password pair or user is disabled.\r\n"
 
 
+def _cmd_acl_setuser(parts: List[str]) -> str:
+    if len(parts) < 3:
+        return "-ERR unknown ACL subcommand\r\n"
+    if parts[2] != "default":
+        return "-ERR unknown user\r\n"
+    for rule in parts[3:]:
+        if rule.startswith(">"):
+            pw_hash = hashlib.sha256(rule[1:].encode()).hexdigest()
+            if pw_hash not in state.default_user_passwords:
+                state.default_user_passwords.append(pw_hash)
+            state.default_user_flags.discard("nopass")
+    return "+OK\r\n"
+
+
+def _cmd_acl_getuser(parts: List[str]) -> str:
+    if len(parts) < 3:
+        return "-ERR unknown ACL subcommand\r\n"
+    if parts[2] != "default":
+        return "$-1\r\n"
+    flags = list(state.default_user_flags)
+    resp = ["*4\r\n", "$5\r\nflags\r\n", f"*{len(flags)}\r\n"]
+    for flag in flags:
+        resp.append(f"${len(flag)}\r\n{flag}\r\n")
+    resp.append("$9\r\npasswords\r\n")
+    resp.append(f"*{len(state.default_user_passwords)}\r\n")
+    for pw in state.default_user_passwords:
+        resp.append(f"${len(pw)}\r\n{pw}\r\n")
+    return "".join(resp)
+
+
 def _cmd_acl(parts: List[str]) -> str:
     """
     Handle the ACL command.
@@ -148,40 +168,15 @@ def _cmd_acl(parts: List[str]) -> str:
     :returns: RESP-encoded response string.
     """
     sub = parts[1].upper()
-
-    if sub == "WHOAMI":
-        return "$7\r\ndefault\r\n"
-
-    if sub == "SETUSER" and len(parts) >= 3:
-        if parts[2] != "default":
-            return "-ERR unknown user\r\n"
-        for rule in parts[3:]:
-            if rule.startswith(">"):
-                pw_hash = hashlib.sha256(rule[1:].encode()).hexdigest()
-                if pw_hash not in state.default_user_passwords:
-                    state.default_user_passwords.append(pw_hash)
-                state.default_user_flags.discard("nopass")
-        return "+OK\r\n"
-
-    if sub == "GETUSER" and len(parts) >= 3:
-        if parts[2] != "default":
-            return "$-1\r\n"
-        flags = list(state.default_user_flags)
-        resp = ["*4\r\n", "$5\r\nflags\r\n", f"*{len(flags)}\r\n"]
-        for flag in flags:
-            resp.append(f"${len(flag)}\r\n{flag}\r\n")
-        resp.append("$9\r\npasswords\r\n")
-        resp.append(f"*{len(state.default_user_passwords)}\r\n")
-        for pw in state.default_user_passwords:
-            resp.append(f"${len(pw)}\r\n{pw}\r\n")
-        return "".join(resp)
-
-    return "-ERR unknown ACL subcommand\r\n"
-
-
-# ---------------------------------------------------------------------------
-# Sorted set helpers
-# ---------------------------------------------------------------------------
+    _ACL_SUBCOMMANDS = {
+        "WHOAMI": lambda _: "$7\r\ndefault\r\n",
+        "SETUSER":  _cmd_acl_setuser,
+        "GETUSER":  _cmd_acl_getuser,
+    }
+    handler = _ACL_SUBCOMMANDS.get(sub)
+    if handler is None:
+        return "-ERR unknown ACL subcommand\r\n"
+    return handler(parts)
 
 
 def _upsert_sorted_set_entry(key: str, member: str, score: float) -> bool:
@@ -199,17 +194,14 @@ def _upsert_sorted_set_entry(key: str, member: str, score: float) -> bool:
             sorted_set=[SortedSetEntry(member=member, score=score)]
         )
         return True
-    existing = next((e for e in stored.sorted_set if e.member == member), None)  # type: ignore[union-attr]
+    existing = next((e for e in stored.sorted_set if e.member ==
+                    member), None)  # type: ignore[union-attr]
     if existing:
         stored.sorted_set.remove(existing)  # type: ignore[union-attr]
-    stored.sorted_set.append(SortedSetEntry(member=member, score=score))  # type: ignore[union-attr]
+    stored.sorted_set.append(SortedSetEntry(
+        member=member, score=score))  # type: ignore[union-attr]
     stored.sorted_set.sort()  # type: ignore[union-attr]
     return existing is None
-
-
-# ---------------------------------------------------------------------------
-# Sorted set commands
-# ---------------------------------------------------------------------------
 
 
 def _cmd_zadd(parts: List[str]) -> str:
@@ -278,7 +270,7 @@ def _cmd_zrange(parts: List[str]) -> str:
         if start >= count or start > stop:
             return "*0\r\n"
         stop = min(stop, count - 1)
-        result = stored.sorted_set[start : stop + 1]
+        result = stored.sorted_set[start: stop + 1]
         resp = [f"*{len(result)}\r\n"]
         for e in result:
             resp.append(f"${len(e.member)}\r\n{e.member}\r\n")
@@ -301,6 +293,7 @@ def _cmd_zcard(parts: List[str]) -> str:
             return "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
         return f":{len(stored.sorted_set)}\r\n"
 
+
 def _cmd_zscore(parts: List[str]) -> str:
     """
     Handle the ZSCORE command.
@@ -315,7 +308,8 @@ def _cmd_zscore(parts: List[str]) -> str:
             return "$-1\r\n"
         if stored.sorted_set is None:
             return "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
-        entry = next((e for e in stored.sorted_set if e.member == member), None)
+        entry = next(
+            (e for e in stored.sorted_set if e.member == member), None)
         if entry is None:
             return "$-1\r\n"
         s = str(entry.score)
@@ -336,16 +330,12 @@ def _cmd_zrem(parts: List[str]) -> str:
             return ":0\r\n"
         if stored.sorted_set is None:
             return "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
-        entry = next((e for e in stored.sorted_set if e.member == member), None)
+        entry = next(
+            (e for e in stored.sorted_set if e.member == member), None)
         if entry is None:
             return ":0\r\n"
         stored.sorted_set.remove(entry)
         return ":1\r\n"
-
-
-# ---------------------------------------------------------------------------
-# Geospatial commands
-# ---------------------------------------------------------------------------
 
 
 def _cmd_geoadd(parts: List[str]) -> str:
@@ -387,7 +377,8 @@ def _cmd_geopos(parts: List[str]) -> str:
         stored = state.data_store.get(key)
         ss = stored.sorted_set if stored else None
         for member in parts[2:]:
-            entry = next((e for e in ss if e.member == member), None) if ss else None
+            entry = next((e for e in ss if e.member == member),
+                         None) if ss else None
             if entry:
                 dec_lon, dec_lat = decode_geohash(int(entry.score))
                 lon_s = format(dec_lon, ".17g")
@@ -438,7 +429,8 @@ def _cmd_geosearch(parts: List[str]) -> str:
     except ValueError:
         return "-ERR invalid arguments\r\n"
 
-    unit_m = {"km": 1000.0, "mi": 1609.344, "ft": 0.3048}.get(parts[7].lower(), 1.0)
+    unit_m = {"km": 1000.0, "mi": 1609.344,
+              "ft": 0.3048}.get(parts[7].lower(), 1.0)
     radius_m = radius * unit_m
     key = parts[1]
 
@@ -458,11 +450,6 @@ def _cmd_geosearch(parts: List[str]) -> str:
     return "".join(resp)
 
 
-# ---------------------------------------------------------------------------
-# Simple inline command helpers
-# ---------------------------------------------------------------------------
-
-
 def _cmd_ping(_parts: List[str]) -> str:
     return "+PONG\r\n"
 
@@ -471,10 +458,6 @@ def _cmd_echo(parts: List[str]) -> str:
     msg = parts[1]
     return f"${len(msg)}\r\n{msg}\r\n"
 
-
-# ---------------------------------------------------------------------------
-# Dispatch table  (defined after all handlers so names are already bound)
-# ---------------------------------------------------------------------------
 
 _COMMAND_DISPATCH = {
     "PING":      (_cmd_ping,      1),

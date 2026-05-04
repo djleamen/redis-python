@@ -28,11 +28,6 @@ from .utils import get_current_time_ms, parse_args
 _WRONGTYPE = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
 
 
-# ---------------------------------------------------------------------------
-# WATCH helpers
-# ---------------------------------------------------------------------------
-
-
 def _notify_key_modified(key: str, modifier: socket.socket) -> None:
     """
     Mark all clients watching *key* (other than *modifier*) as dirty so that
@@ -117,9 +112,6 @@ def handle_client(client: socket.socket) -> None:
                 client.send(b"-NOAUTH Authentication required.\r\n")
                 continue
 
-            # ------------------------------------------------------------------
-            # Transaction commands
-            # ------------------------------------------------------------------
             if command == "MULTI":
                 in_transaction = True
                 transaction_queue = []
@@ -171,15 +163,9 @@ def handle_client(client: socket.socket) -> None:
                 transaction_queue.append(parts)
                 response = "+QUEUED\r\n"
 
-            # ------------------------------------------------------------------
-            # Pub / sub mode commands
-            # ------------------------------------------------------------------
             elif command == "PING" and is_subscribed_mode:
                 response = "*2\r\n$4\r\npong\r\n$0\r\n\r\n"
 
-            # ------------------------------------------------------------------
-            # Authentication
-            # ------------------------------------------------------------------
             elif command == "AUTH" and len(parts) >= 3:
                 username, password = parts[1], parts[2]
                 if username == "default":
@@ -196,9 +182,6 @@ def handle_client(client: socket.socket) -> None:
                 else:
                     response = "-WRONGPASS invalid username-password pair or user is disabled.\r\n"
 
-            # ------------------------------------------------------------------
-            # Server info / config
-            # ------------------------------------------------------------------
             elif command == "INFO":
                 is_replica = state.master_host is not None
                 role = "slave" if is_replica else "master"
@@ -250,9 +233,6 @@ def handle_client(client: socket.socket) -> None:
                 for k in matching:
                     response += f"${len(k)}\r\n{k}\r\n"
 
-            # ------------------------------------------------------------------
-            # Replication protocol
-            # ------------------------------------------------------------------
             elif command == "REPLCONF":
                 if len(parts) >= 3 and parts[1].upper() == "ACK":
                     try:
@@ -274,9 +254,6 @@ def handle_client(client: socket.socket) -> None:
                 is_replication_connection = True
                 continue
 
-            # ------------------------------------------------------------------
-            # String write (requires propagation)
-            # ------------------------------------------------------------------
             elif command == "SET" and len(parts) >= 3:
                 response = execute_command(parts)
                 if not is_replication_connection:
@@ -285,9 +262,6 @@ def handle_client(client: socket.socket) -> None:
                     if state.appendonly.lower() == "yes":
                         append_to_aof(parts)
 
-            # ------------------------------------------------------------------
-            # Stateless commands — delegate to execute_command
-            # ------------------------------------------------------------------
             elif command in {
                 "PING", "ECHO", "GET", "INCR",
                 "ACL",
@@ -298,9 +272,6 @@ def handle_client(client: socket.socket) -> None:
                 if command in {"INCR", "ZADD", "ZREM", "GEOADD"} and len(parts) >= 2:
                     _notify_key_modified(parts[1], client)
 
-            # ------------------------------------------------------------------
-            # List commands
-            # ------------------------------------------------------------------
             elif command == "RPUSH" and len(parts) >= 3:
                 response = cmd_rpush(parts)
                 _notify_key_modified(parts[1], client)

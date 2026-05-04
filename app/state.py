@@ -12,38 +12,18 @@ from typing import Dict, List, Optional, Set
 
 from .models import StoredValue
 
-# ---------------------------------------------------------------------------
-# Data store
-# ---------------------------------------------------------------------------
-
 data_store: Dict[str, StoredValue] = {}
 data_store_lock = threading.Lock()
-
-# ---------------------------------------------------------------------------
-# Blocking list clients
-# ---------------------------------------------------------------------------
 
 blocked_clients: Dict[str, deque] = {}
 blocked_clients_lock = threading.Lock()
 
-# ---------------------------------------------------------------------------
-# Blocking stream readers
-# ---------------------------------------------------------------------------
-
 blocked_stream_readers: Dict[str, deque] = {}
 blocked_stream_readers_lock = threading.Lock()
-
-# ---------------------------------------------------------------------------
-# Pub / sub
-# ---------------------------------------------------------------------------
 
 channel_subscribers: Dict[str, Set[socket.socket]] = {}
 client_subscriptions: Dict[socket.socket, Set[str]] = {}
 subscriptions_lock = threading.Lock()
-
-# ---------------------------------------------------------------------------
-# Replication
-# ---------------------------------------------------------------------------
 
 replica_connections: List[socket.socket] = []
 replica_connections_lock = threading.Lock()
@@ -55,34 +35,18 @@ master_offset: int = 0
 REPLICATION_ID = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb"
 REPLICATION_OFFSET = 0
 
-# ---------------------------------------------------------------------------
-# ACL / authentication
-# ---------------------------------------------------------------------------
-
 default_user_flags: Set[str] = {"nopass"}
 default_user_passwords: List[str] = []
-
-# ---------------------------------------------------------------------------
-# Watch state for WATCH/UNWATCH/MULTI/EXEC transactions
-# ---------------------------------------------------------------------------
 
 key_watchers: Dict[str, Set[socket.socket]] = {}
 watch_dirty: Dict[socket.socket, bool] = {}
 watch_lock = threading.Lock()
-
-# ---------------------------------------------------------------------------
-# Append-only file (AOF) configuration
-# ---------------------------------------------------------------------------
 
 appendonly: str = "no"
 appenddirname: str = "/tmp/redis-files"
 appendfilename: str = "appendonly.aof"
 appendfsync: str = "everysec"
 aof_file_path: Optional[str] = None
-
-# ---------------------------------------------------------------------------
-# Server configuration (populated at startup via parse_args)
-# ---------------------------------------------------------------------------
 
 dir_path: str = "/tmp/redis-files"
 dbfilename: str = "dump.rdb"

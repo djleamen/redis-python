@@ -12,6 +12,7 @@ from .blocking import unblock_waiting_clients
 from .models import BlockedClient, StoredValue
 
 _WRONGTYPE = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+_ERR_NOT_INT = "-ERR value is not an integer or out of range\r\n"
 
 
 def cmd_rpush(parts: List[str]) -> str:
@@ -72,7 +73,7 @@ def cmd_lrange(parts: List[str]) -> str:
     try:
         start, stop = int(parts[2]), int(parts[3])
     except ValueError:
-        return "-ERR value is not an integer or out of range\r\n"
+        return _ERR_NOT_INT
 
     with state.data_store_lock:
         stored = state.data_store.get(key)
@@ -126,9 +127,9 @@ def cmd_lpop(parts: List[str]):
         try:
             count = int(parts[2])
             if count < 1:
-                return "-ERR value is not an integer or out of range\r\n"
+                return _ERR_NOT_INT
         except ValueError:
-            return "-ERR value is not an integer or out of range\r\n"
+            return _ERR_NOT_INT
 
     with state.data_store_lock:
         stored = state.data_store.get(key)
@@ -149,6 +150,21 @@ def cmd_lpop(parts: List[str]):
         else:
             elem = stored.list_value.pop(0)
             return f"${len(elem)}\r\n{elem}\r\n"
+
+
+def _remove_blocked_client(key: str, blocked: BlockedClient) -> None:
+    """Remove *blocked* from the waiting queue for *key* after a timeout."""
+    with state.blocked_clients_lock:
+        if key not in state.blocked_clients:
+            return
+        try:
+            new_q = deque(bc for bc in state.blocked_clients[key] if bc is not blocked)
+            if new_q:
+                state.blocked_clients[key] = new_q
+            else:
+                del state.blocked_clients[key]
+        except (KeyError, ValueError):
+            pass
 
 
 def cmd_blpop(client: socket.socket, parts: List[str]) -> str:
@@ -199,15 +215,5 @@ def cmd_blpop(client: socket.socket, parts: List[str]) -> str:
         elem = result[0]
         return f"*2\r\n${len(key)}\r\n{key}\r\n${len(elem)}\r\n{elem}\r\n"
 
-    with state.blocked_clients_lock:
-        if key in state.blocked_clients:
-            try:
-                new_q = deque(
-                    bc for bc in state.blocked_clients[key] if bc is not blocked)
-                if new_q:
-                    state.blocked_clients[key] = new_q
-                else:
-                    del state.blocked_clients[key]
-            except (KeyError, ValueError):
-                pass
+    _remove_blocked_client(key, blocked)
     return "*-1\r\n"
