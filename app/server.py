@@ -7,6 +7,7 @@ import os
 import socket
 import threading
 import time
+from dataclasses import dataclass, field
 from typing import List
 
 from . import state
@@ -26,6 +27,30 @@ from .streams import cmd_xadd, cmd_xread, cmd_xrange
 from .utils import get_current_time_ms, parse_args
 
 _WRONGTYPE = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+_WRONGPASS = "-WRONGPASS invalid username-password pair or user is disabled.\r\n"
+_WRITE_CMDS = {"SET", "INCR", "ZADD", "ZREM", "GEOADD", "XADD", "RPUSH", "LPUSH"}
+_EXECUTE_CMDS = {
+    "PING", "ECHO", "GET", "INCR",
+    "ACL",
+    "ZADD", "ZRANK", "ZRANGE", "ZCARD", "ZSCORE", "ZREM",
+    "GEOADD", "GEOPOS", "GEODIST", "GEOSEARCH",
+}
+_NOTIFY_CMDS = {"INCR", "ZADD", "ZREM", "GEOADD"}
+_SUBSCRIBED_ALLOWED = {
+    "SUBSCRIBE", "UNSUBSCRIBE", "PSUBSCRIBE",
+    "PUNSUBSCRIBE", "PING", "QUIT", "RESET",
+}
+
+
+@dataclass
+class _ClientCtx:
+    client: socket.socket
+    in_transaction: bool = False
+    transaction_queue: List[List[str]] = field(default_factory=list)
+    watched_keys: set = field(default_factory=set)
+    is_replication_connection: bool = False
+    is_subscribed_mode: bool = False
+    is_authenticated: bool = field(default_factory=lambda: "nopass" in state.default_user_flags)
 
 
 def _notify_key_modified(key: str, modifier: socket.socket) -> None:
@@ -63,286 +88,251 @@ def _clear_watch_state(client: socket.socket, watched_keys: set) -> None:
     watched_keys.clear()
 
 
+def _handle_multi(ctx: "_ClientCtx", parts: List[str]) -> str:
+    ctx.in_transaction = True
+    ctx.transaction_queue = []
+    return "+OK\r\n"
+
+
+def _handle_exec(ctx: "_ClientCtx", parts: List[str]) -> str:
+    if not ctx.in_transaction:
+        return "-ERR EXEC without MULTI\r\n"
+    if state.watch_dirty.get(ctx.client, False):
+        response = "*-1\r\n"
+    else:
+        responses = []
+        for cmd in ctx.transaction_queue:
+            r = execute_command(cmd)
+            responses.append(r)
+            if cmd and len(cmd) >= 2 and cmd[0].upper() in _WRITE_CMDS:
+                _notify_key_modified(cmd[1], ctx.client)
+        response = f"*{len(responses)}\r\n" + "".join(responses)
+    ctx.in_transaction = False
+    ctx.transaction_queue = []
+    _clear_watch_state(ctx.client, ctx.watched_keys)
+    return response
+
+
+def _handle_discard(ctx: "_ClientCtx", parts: List[str]) -> str:
+    if not ctx.in_transaction:
+        return "-ERR DISCARD without MULTI\r\n"
+    ctx.in_transaction = False
+    ctx.transaction_queue = []
+    _clear_watch_state(ctx.client, ctx.watched_keys)
+    return "+OK\r\n"
+
+
+def _handle_watch(ctx: "_ClientCtx", parts: List[str]) -> str:
+    if ctx.in_transaction:
+        return "-ERR WATCH inside MULTI is not allowed\r\n"
+    with state.watch_lock:
+        for key in parts[1:]:
+            state.key_watchers.setdefault(key, set()).add(ctx.client)
+            ctx.watched_keys.add(key)
+    return "+OK\r\n"
+
+
+def _handle_auth(ctx: "_ClientCtx", parts: List[str]) -> str:
+    username, password = parts[1], parts[2]
+    if username != "default":
+        return _WRONGPASS
+    if "nopass" in state.default_user_flags:
+        ctx.is_authenticated = True
+        return "+OK\r\n"
+    pw_hash = hashlib.sha256(password.encode()).hexdigest()
+    if pw_hash in state.default_user_passwords:
+        ctx.is_authenticated = True
+        return "+OK\r\n"
+    return _WRONGPASS
+
+
+def _handle_info(ctx: "_ClientCtx", parts: List[str]) -> str:
+    is_replica = state.master_host is not None
+    role = "slave" if is_replica else "master"
+    if len(parts) == 1 or parts[1].upper() == "REPLICATION":
+        if is_replica:
+            info = f"role:{role}"
+        else:
+            info = (
+                f"role:{role}\r\n"
+                f"master_replid:{state.REPLICATION_ID}\r\n"
+                f"master_repl_offset:{state.REPLICATION_OFFSET}"
+            )
+        return f"${len(info)}\r\n{info}\r\n"
+    return "$0\r\n\r\n"
+
+
+def _handle_config_get(ctx: "_ClientCtx", parts: List[str]) -> str:
+    parameter = parts[2].lower()
+    _config_map = {
+        "dir": state.dir_path,
+        "dbfilename": state.dbfilename,
+        "appendonly": state.appendonly,
+        "appenddirname": state.appenddirname,
+        "appendfilename": state.appendfilename,
+        "appendfsync": state.appendfsync,
+    }
+    value = _config_map.get(parameter)
+    if value is not None:
+        return (
+            f"*2\r\n${len(parameter)}\r\n{parameter}\r\n"
+            f"${len(value)}\r\n{value}\r\n"
+        )
+    return "*0\r\n"
+
+
+def _handle_keys(ctx: "_ClientCtx", parts: List[str]) -> str:
+    pattern = parts[1]
+    with state.data_store_lock:
+        matching = [
+            k for k, v in state.data_store.items()
+            if (pattern == "*" or k == pattern)
+            and (not v.expiry_ms or get_current_time_ms() <= v.expiry_ms)
+        ]
+    response = f"*{len(matching)}\r\n"
+    for k in matching:
+        response += f"${len(k)}\r\n{k}\r\n"
+    return response
+
+
+def _handle_replconf(ctx: "_ClientCtx", parts: List[str]) -> str:
+    if len(parts) >= 3 and parts[1].upper() == "ACK":
+        try:
+            ack_offset = int(parts[2])
+            with state.replica_connections_lock:
+                if ctx.client in state.replica_connections:
+                    state.replica_ack_offsets[ctx.client] = ack_offset
+        except ValueError:
+            pass
+        return ""
+    return "+OK\r\n"
+
+
+def _dispatch_command(ctx: "_ClientCtx", parts: List[str], input_str: str) -> str:
+    """Route a single command to the appropriate handler; return RESP response."""
+    command = parts[0].upper()
+
+    if command == "MULTI":
+        return _handle_multi(ctx, parts)
+    if command == "EXEC":
+        return _handle_exec(ctx, parts)
+    if command == "DISCARD":
+        return _handle_discard(ctx, parts)
+    if command == "WATCH" and len(parts) >= 2:
+        return _handle_watch(ctx, parts)
+    if command == "UNWATCH":
+        _clear_watch_state(ctx.client, ctx.watched_keys)
+        return "+OK\r\n"
+    if ctx.in_transaction:
+        ctx.transaction_queue.append(parts)
+        return "+QUEUED\r\n"
+    if command == "PING" and ctx.is_subscribed_mode:
+        return "*2\r\n$4\r\npong\r\n$0\r\n\r\n"
+    if command == "AUTH" and len(parts) >= 3:
+        return _handle_auth(ctx, parts)
+    if command == "INFO":
+        return _handle_info(ctx, parts)
+    if command == "CONFIG" and len(parts) >= 3 and parts[1].upper() == "GET":
+        return _handle_config_get(ctx, parts)
+    if command == "KEYS" and len(parts) >= 2:
+        return _handle_keys(ctx, parts)
+    if command == "REPLCONF":
+        return _handle_replconf(ctx, parts)
+    if command == "PSYNC" and len(parts) >= 3:
+        ctx.client.send(build_fullresync_payload())
+        with state.replica_connections_lock:
+            state.replica_connections.append(ctx.client)
+            state.replica_ack_offsets[ctx.client] = 0
+        ctx.is_replication_connection = True
+        return ""
+    if command == "SET" and len(parts) >= 3:
+        response = execute_command(parts)
+        if not ctx.is_replication_connection:
+            propagate_to_replicas(input_str)
+            _notify_key_modified(parts[1], ctx.client)
+            if state.appendonly.lower() == "yes":
+                append_to_aof(parts)
+        return response
+    if command in _EXECUTE_CMDS:
+        response = execute_command(parts)
+        if command in _NOTIFY_CMDS and len(parts) >= 2:
+            _notify_key_modified(parts[1], ctx.client)
+        return response
+    if command == "RPUSH" and len(parts) >= 3:
+        _notify_key_modified(parts[1], ctx.client)
+        return cmd_rpush(parts)
+    if command == "LPUSH" and len(parts) >= 3:
+        _notify_key_modified(parts[1], ctx.client)
+        return cmd_lpush(parts)
+    if command == "LRANGE" and len(parts) >= 4:
+        return cmd_lrange(parts)
+    if command == "LLEN" and len(parts) >= 2:
+        return cmd_llen(parts)
+    if command == "LPOP" and len(parts) >= 2:
+        return cmd_lpop(parts) or ""
+    if command == "BLPOP" and len(parts) >= 3:
+        return cmd_blpop(ctx.client, parts)
+    if command == "TYPE" and len(parts) >= 2:
+        return _cmd_type(parts)
+    if command == "WAIT" and len(parts) >= 3:
+        return _cmd_wait(parts)
+    if command == "PUBLISH" and len(parts) >= 3:
+        return cmd_publish(parts)
+    if command == "SUBSCRIBE" and len(parts) >= 2:
+        cmd_subscribe(ctx.client, parts)
+        ctx.is_subscribed_mode = True
+        return ""
+    if command == "UNSUBSCRIBE" and len(parts) >= 2:
+        ctx.is_subscribed_mode = cmd_unsubscribe(ctx.client, parts)
+        return ""
+    if command == "XADD" and len(parts) >= 4:
+        response = cmd_xadd(parts)
+        if not response.startswith("-"):
+            _notify_key_modified(parts[1], ctx.client)
+        return response
+    if command == "XREAD" and len(parts) >= 4:
+        return cmd_xread(ctx.client, parts)
+    if command == "XRANGE" and len(parts) >= 4:
+        return cmd_xrange(parts)
+    return "-ERR unknown command\r\n"
+
+
 def handle_client(client: socket.socket) -> None:
     """
     Manage the full lifecycle of a single client connection.
 
-    Maintains per-connection state for transactions, authentication, pub/sub
-    subscriptions, and whether the connection has been promoted to a replica
-    replication stream.
-
     :param client: Connected client socket.
     """
-    in_transaction = False
-    transaction_queue: List[List[str]] = []
-    watched_keys: set = set()
-    is_replication_connection = False
-    is_subscribed_mode = False
-    is_authenticated = "nopass" in state.default_user_flags
+    ctx = _ClientCtx(client=client)
 
     while True:
         try:
             buf = client.recv(1024)
             if not buf:
                 break
-
             input_str = buf.decode("utf-8")
             parts = parse_resp_array(input_str)
             if not parts:
                 continue
-
             command = parts[0].upper()
-            response = ""
 
-            if is_subscribed_mode:
-                allowed = {
-                    "SUBSCRIBE", "UNSUBSCRIBE", "PSUBSCRIBE",
-                    "PUNSUBSCRIBE", "PING", "QUIT", "RESET",
-                }
-                if command not in allowed:
-                    msg = command.lower()
-                    client.send(
-                        f"-ERR Can't execute '{msg}': only (P|S)SUBSCRIBE / "
-                        f"(P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed "
-                        f"in this context\r\n".encode("utf-8")
-                    )
-                    continue
+            if ctx.is_subscribed_mode and command not in _SUBSCRIBED_ALLOWED:
+                client.send(
+                    f"-ERR Can't execute '{command.lower()}': only (P|S)SUBSCRIBE / "
+                    f"(P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed "
+                    f"in this context\r\n".encode("utf-8")
+                )
+                continue
 
-            if not is_authenticated and command not in {"AUTH", "HELLO", "QUIT", "RESET"}:
+            if not ctx.is_authenticated and command not in {"AUTH", "HELLO", "QUIT", "RESET"}:
                 client.send(b"-NOAUTH Authentication required.\r\n")
                 continue
 
-            if command == "MULTI":
-                in_transaction = True
-                transaction_queue = []
-                response = "+OK\r\n"
-
-            elif command == "EXEC":
-                if in_transaction:
-                    if state.watch_dirty.get(client, False):
-                        response = "*-1\r\n"
-                    else:
-                        _write_cmds = {"SET", "INCR", "ZADD", "ZREM", "GEOADD", "XADD", "RPUSH", "LPUSH"}
-                        responses = []
-                        for cmd in transaction_queue:
-                            r = execute_command(cmd)
-                            responses.append(r)
-                            if cmd and len(cmd) >= 2 and cmd[0].upper() in _write_cmds:
-                                _notify_key_modified(cmd[1], client)
-                        response = f"*{len(responses)}\r\n" + "".join(responses)
-                    in_transaction = False
-                    transaction_queue = []
-                    _clear_watch_state(client, watched_keys)
-                else:
-                    response = "-ERR EXEC without MULTI\r\n"
-
-            elif command == "DISCARD":
-                if in_transaction:
-                    in_transaction = False
-                    transaction_queue = []
-                    _clear_watch_state(client, watched_keys)
-                    response = "+OK\r\n"
-                else:
-                    response = "-ERR DISCARD without MULTI\r\n"
-
-            elif command == "WATCH" and len(parts) >= 2:
-                if in_transaction:
-                    response = "-ERR WATCH inside MULTI is not allowed\r\n"
-                else:
-                    with state.watch_lock:
-                        for key in parts[1:]:
-                            state.key_watchers.setdefault(key, set()).add(client)
-                            watched_keys.add(key)
-                    response = "+OK\r\n"
-
-            elif command == "UNWATCH":
-                _clear_watch_state(client, watched_keys)
-                response = "+OK\r\n"
-
-            elif in_transaction:
-                transaction_queue.append(parts)
-                response = "+QUEUED\r\n"
-
-            elif command == "PING" and is_subscribed_mode:
-                response = "*2\r\n$4\r\npong\r\n$0\r\n\r\n"
-
-            elif command == "AUTH" and len(parts) >= 3:
-                username, password = parts[1], parts[2]
-                if username == "default":
-                    if "nopass" in state.default_user_flags:
-                        is_authenticated = True
-                        response = "+OK\r\n"
-                    else:
-                        pw_hash = hashlib.sha256(password.encode()).hexdigest()
-                        if pw_hash in state.default_user_passwords:
-                            is_authenticated = True
-                            response = "+OK\r\n"
-                        else:
-                            response = "-WRONGPASS invalid username-password pair or user is disabled.\r\n"
-                else:
-                    response = "-WRONGPASS invalid username-password pair or user is disabled.\r\n"
-
-            elif command == "INFO":
-                is_replica = state.master_host is not None
-                role = "slave" if is_replica else "master"
-                if len(parts) == 1 or parts[1].upper() == "REPLICATION":
-                    if is_replica:
-                        info = f"role:{role}"
-                    else:
-                        info = (
-                            f"role:{role}\r\n"
-                            f"master_replid:{state.REPLICATION_ID}\r\n"
-                            f"master_repl_offset:{state.REPLICATION_OFFSET}"
-                        )
-                    response = f"${len(info)}\r\n{info}\r\n"
-                else:
-                    response = "$0\r\n\r\n"
-
-            elif command == "CONFIG" and len(parts) >= 3 and parts[1].upper() == "GET":
-                parameter = parts[2].lower()
-                value = None
-                if parameter == "dir":
-                    value = state.dir_path
-                elif parameter == "dbfilename":
-                    value = state.dbfilename
-                elif parameter == "appendonly":
-                    value = state.appendonly
-                elif parameter == "appenddirname":
-                    value = state.appenddirname
-                elif parameter == "appendfilename":
-                    value = state.appendfilename
-                elif parameter == "appendfsync":
-                    value = state.appendfsync
-                if value is not None:
-                    response = (
-                        f"*2\r\n${len(parameter)}\r\n{parameter}\r\n"
-                        f"${len(value)}\r\n{value}\r\n"
-                    )
-                else:
-                    response = "*0\r\n"
-
-            elif command == "KEYS" and len(parts) >= 2:
-                pattern = parts[1]
-                with state.data_store_lock:
-                    matching = [
-                        k for k, v in state.data_store.items()
-                        if (pattern == "*" or k == pattern)
-                        and (not v.expiry_ms or get_current_time_ms() <= v.expiry_ms)
-                    ]
-                response = f"*{len(matching)}\r\n"
-                for k in matching:
-                    response += f"${len(k)}\r\n{k}\r\n"
-
-            elif command == "REPLCONF":
-                if len(parts) >= 3 and parts[1].upper() == "ACK":
-                    try:
-                        ack_offset = int(parts[2])
-                        with state.replica_connections_lock:
-                            if client in state.replica_connections:
-                                state.replica_ack_offsets[client] = ack_offset
-                    except ValueError:
-                        pass
-                    response = ""
-                else:
-                    response = "+OK\r\n"
-
-            elif command == "PSYNC" and len(parts) >= 3:
-                client.send(build_fullresync_payload())
-                with state.replica_connections_lock:
-                    state.replica_connections.append(client)
-                    state.replica_ack_offsets[client] = 0
-                is_replication_connection = True
-                continue
-
-            elif command == "SET" and len(parts) >= 3:
-                response = execute_command(parts)
-                if not is_replication_connection:
-                    propagate_to_replicas(input_str)
-                    _notify_key_modified(parts[1], client)
-                    if state.appendonly.lower() == "yes":
-                        append_to_aof(parts)
-
-            elif command in {
-                "PING", "ECHO", "GET", "INCR",
-                "ACL",
-                "ZADD", "ZRANK", "ZRANGE", "ZCARD", "ZSCORE", "ZREM",
-                "GEOADD", "GEOPOS", "GEODIST", "GEOSEARCH",
-            }:
-                response = execute_command(parts)
-                if command in {"INCR", "ZADD", "ZREM", "GEOADD"} and len(parts) >= 2:
-                    _notify_key_modified(parts[1], client)
-
-            elif command == "RPUSH" and len(parts) >= 3:
-                response = cmd_rpush(parts)
-                _notify_key_modified(parts[1], client)
-
-            elif command == "LPUSH" and len(parts) >= 3:
-                response = cmd_lpush(parts)
-                _notify_key_modified(parts[1], client)
-
-            elif command == "LRANGE" and len(parts) >= 4:
-                response = cmd_lrange(parts)
-
-            elif command == "LLEN" and len(parts) >= 2:
-                response = cmd_llen(parts)
-
-            elif command == "LPOP" and len(parts) >= 2:
-                result = cmd_lpop(parts)
-                if result is None:
-                    continue
-                response = result
-
-            elif command == "BLPOP" and len(parts) >= 3:
-                response = cmd_blpop(client, parts)
-
-            # ------------------------------------------------------------------
-            # Key metadata
-            # ------------------------------------------------------------------
-            elif command == "TYPE" and len(parts) >= 2:
-                response = _cmd_type(parts)
-
-            # ------------------------------------------------------------------
-            # Replication wait
-            # ------------------------------------------------------------------
-            elif command == "WAIT" and len(parts) >= 3:
-                response = _cmd_wait(parts)
-
-            # ------------------------------------------------------------------
-            # Pub / sub
-            # ------------------------------------------------------------------
-            elif command == "PUBLISH" and len(parts) >= 3:
-                response = cmd_publish(parts)
-
-            elif command == "SUBSCRIBE" and len(parts) >= 2:
-                cmd_subscribe(client, parts)
-                is_subscribed_mode = True
-                response = ""
-
-            elif command == "UNSUBSCRIBE" and len(parts) >= 2:
-                is_subscribed_mode = cmd_unsubscribe(client, parts)
-                response = ""
-
-            # ------------------------------------------------------------------
-            # Stream commands
-            # ------------------------------------------------------------------
-            elif command == "XADD" and len(parts) >= 4:
-                response = cmd_xadd(parts)
-                if not response.startswith("-"):
-                    _notify_key_modified(parts[1], client)
-
-            elif command == "XREAD" and len(parts) >= 4:
-                response = cmd_xread(client, parts)
-
-            elif command == "XRANGE" and len(parts) >= 4:
-                response = cmd_xrange(parts)
-
-            else:
-                response = "-ERR unknown command\r\n"
-
-            if response and not is_replication_connection:
+            response = _dispatch_command(ctx, parts, input_str)
+            if response and not ctx.is_replication_connection:
                 client.send(response.encode("utf-8"))
 
-        except (socket.error, BrokenPipeError, ConnectionResetError, OSError):
+        except OSError:
             break
 
     # Cleanup replica state
@@ -362,14 +352,9 @@ def handle_client(client: socket.socket) -> None:
             del state.client_subscriptions[client]
 
     # Cleanup watch state
-    _clear_watch_state(client, watched_keys)
+    _clear_watch_state(client, ctx.watched_keys)
 
     client.close()
-
-
-# ---------------------------------------------------------------------------
-# Type command
-# ---------------------------------------------------------------------------
 
 
 def _cmd_type(parts: List[str]) -> str:
@@ -396,11 +381,6 @@ def _cmd_type(parts: List[str]) -> str:
         if stored.sorted_set is not None:
             return "+zset\r\n"
         return "+none\r\n"
-
-
-# ---------------------------------------------------------------------------
-# WAIT command
-# ---------------------------------------------------------------------------
 
 
 def _cmd_wait(parts: List[str]) -> str:
@@ -441,11 +421,6 @@ def _cmd_wait(parts: List[str]) -> str:
         time.sleep(0.01)
 
     return f":{acked}\r\n"
-
-
-# ---------------------------------------------------------------------------
-# Server entry point
-# ---------------------------------------------------------------------------
 
 
 def main() -> None:
