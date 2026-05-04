@@ -32,6 +32,35 @@ def parse_resp_array(input_str: str) -> List[str]:
     return parts
 
 
+def _parse_bulk_element(
+    lines: List[str], line_index: int
+) -> Tuple[str, int, int]:
+    """
+    Parse one bulk-string element from a split RESP line sequence.
+
+    :param lines: All lines from the raw data buffer split on ``\\r\\n``.
+    :param line_index: Index of the ``$<length>`` line for this element.
+    :returns: ``(value, next_line_index, bytes_consumed)``
+    :raises ValueError: When the element is incomplete or malformed.
+    """
+    if line_index >= len(lines):
+        raise ValueError
+    length_line = lines[line_index]
+    if not length_line.startswith("$"):
+        raise ValueError
+    bulk_length = int(length_line[1:])
+    line_index += 1
+    if line_index >= len(lines):
+        raise ValueError
+    value = lines[line_index]
+    if len(value) != bulk_length and (
+        line_index == len(lines) - 1
+        or (line_index == len(lines) - 2 and lines[line_index + 1] == "")
+    ):
+        raise ValueError
+    return value, line_index + 1, len(length_line) + 2 + len(value) + 2
+
+
 def try_parse_resp_command(data: str) -> Tuple[Optional[List[str]], int]:
     """
     Attempt to parse a single complete RESP command from buffered data.
@@ -56,35 +85,13 @@ def try_parse_resp_command(data: str) -> Tuple[Optional[List[str]], int]:
     line_index = 1
     bytes_consumed = len(lines[0]) + 2  # +2 for \r\n
 
-    for _ in range(array_length):
-        if line_index >= len(lines):
-            return None, 0
-
-        length_line = lines[line_index]
-        if not length_line.startswith("$"):
-            return None, 0
-
-        try:
-            bulk_length = int(length_line[1:])
-        except ValueError:
-            return None, 0
-
-        bytes_consumed += len(length_line) + 2
-        line_index += 1
-
-        if line_index >= len(lines):
-            return None, 0
-
-        value = lines[line_index]
-        if len(value) != bulk_length:
-            if line_index == len(lines) - 1 or (
-                line_index == len(lines) - 2 and lines[line_index + 1] == ""
-            ):
-                return None, 0
-
-        parts.append(value)
-        bytes_consumed += len(value) + 2
-        line_index += 1
+    try:
+        for _ in range(array_length):
+            value, line_index, extra = _parse_bulk_element(lines, line_index)
+            parts.append(value)
+            bytes_consumed += extra
+    except ValueError:
+        return None, 0
 
     return parts, bytes_consumed
 
