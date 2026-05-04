@@ -25,7 +25,7 @@ def cmd_publish(parts: List[str]) -> str:
                 f"${len(channel)}\r\n{channel}\r\n"
                 f"${len(message)}\r\n{message}\r\n"
             ).encode("utf-8")
-            for sub in list(state.channel_subscribers[channel]):
+            for sub in state.channel_subscribers[channel]:
                 try:
                     sub.send(msg)
                 except (socket.error, OSError):
