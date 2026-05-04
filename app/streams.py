@@ -55,6 +55,93 @@ def resolve_stream_id(key: str, id_str: str) -> str:
     return "0-0"
 
 
+_ERR_INVALID_ID = "-ERR Invalid stream ID specified as stream command argument\r\n"
+
+
+def _resolve_full_auto_id(key: str) -> tuple:
+    """Resolve a ``*`` entry ID to ``(millis_time, seq_num)``."""
+    millis_time = get_current_time_ms()
+    seq_num = 0
+    with state.data_store_lock:
+        entries = state.data_store[key].stream if key in state.data_store else None
+        if entries:
+            last_ms, last_seq = map(int, entries[-1].id.split("-"))
+            if millis_time == last_ms:
+                seq_num = last_seq + 1
+            elif millis_time <= last_ms:
+                millis_time, seq_num = last_ms, last_seq + 1
+    return millis_time, seq_num
+
+
+def _resolve_partial_auto_seq(key: str, millis_time: int) -> int:
+    """Resolve a ``ms-*`` entry ID to its sequence number."""
+    with state.data_store_lock:
+        entries = state.data_store[key].stream if key in state.data_store else None
+        if entries:
+            last_ms, last_seq = map(int, entries[-1].id.split("-"))
+            if millis_time == last_ms:
+                return last_seq + 1
+            return 1 if millis_time == 0 else 0
+        return 1 if millis_time == 0 else 0
+
+
+def _parse_xadd_id(key: str, entry_id: str):
+    """
+    Parse and resolve *entry_id* for XADD.
+
+    :returns: ``(entry_id, millis_time, seq_num)`` on success, or an error
+        string on failure.
+    """
+    if entry_id == "*":
+        millis_time, seq_num = _resolve_full_auto_id(key)
+        return f"{millis_time}-{seq_num}", millis_time, seq_num
+
+    id_parts = entry_id.split("-")
+    if len(id_parts) != 2:
+        return _ERR_INVALID_ID
+    try:
+        millis_time = int(id_parts[0])
+    except ValueError:
+        return _ERR_INVALID_ID
+
+    if id_parts[1] == "*":
+        seq_num = _resolve_partial_auto_seq(key, millis_time)
+        return f"{millis_time}-{seq_num}", millis_time, seq_num
+
+    try:
+        seq_num = int(id_parts[1])
+    except ValueError:
+        return _ERR_INVALID_ID
+
+    return entry_id, millis_time, seq_num
+
+
+def _append_stream_entry(
+    key: str, entry_id: str, millis_time: int, seq_num: int, fields: dict
+) -> str:
+    """Validate entry ordering and insert into the stream. Returns RESP response."""
+    with state.data_store_lock:
+        entries = state.data_store[key].stream if key in state.data_store else None
+        if entries:
+            last_ms, last_seq = map(int, entries[-1].id.split("-"))
+            if millis_time < last_ms or (millis_time == last_ms and seq_num <= last_seq):
+                return (
+                    "-ERR The ID specified in XADD is equal or smaller than"
+                    " the target stream top item\r\n"
+                )
+
+        entry = StreamEntry(entry_id, fields)
+        if key not in state.data_store:
+            state.data_store[key] = StoredValue(stream=[entry])
+        elif state.data_store[key].stream is not None:
+            state.data_store[key].stream.append(entry)  # type: ignore[union-attr]
+        else:
+            return _WRONGTYPE
+
+    unblock_waiting_stream_readers(key)
+    return f"${len(entry_id)}\r\n{entry_id}\r\n"
+
+
 def cmd_xadd(parts: List[str]) -> str:
     """
     Handle the XADD command: append an entry to a stream.
@@ -67,72 +154,16 @@ def cmd_xadd(parts: List[str]) -> str:
     if (len(parts) - 3) % 2 != 0:
         return "-ERR wrong number of arguments for XADD\r\n"
 
-    millis_time = 0
-    seq_num = 0
-
-    if entry_id == "*":
-        millis_time = get_current_time_ms()
-        with state.data_store_lock:
-            entries = state.data_store[key].stream if key in state.data_store else None
-            if entries:
-                last_ms, last_seq = map(int, entries[-1].id.split("-"))
-                if millis_time == last_ms:
-                    seq_num = last_seq + 1
-                elif millis_time <= last_ms:
-                    millis_time, seq_num = last_ms, last_seq + 1
-        entry_id = f"{millis_time}-{seq_num}"
-
-    else:
-        id_parts = entry_id.split("-")
-        if len(id_parts) != 2:
-            return "-ERR Invalid stream ID specified as stream command argument\r\n"
-        try:
-            millis_time = int(id_parts[0])
-        except ValueError:
-            return "-ERR Invalid stream ID specified as stream command argument\r\n"
-
-        if id_parts[1] == "*":
-            with state.data_store_lock:
-                entries = state.data_store[key].stream if key in state.data_store else None
-                if entries:
-                    last_ms, last_seq = map(int, entries[-1].id.split("-"))
-                    seq_num = last_seq + \
-                        1 if millis_time == last_ms else (
-                            1 if millis_time == 0 else 0)
-                else:
-                    seq_num = 1 if millis_time == 0 else 0
-            entry_id = f"{millis_time}-{seq_num}"
-        else:
-            try:
-                seq_num = int(id_parts[1])
-            except ValueError:
-                return "-ERR Invalid stream ID specified as stream command argument\r\n"
+    parsed = _parse_xadd_id(key, entry_id)
+    if isinstance(parsed, str):
+        return parsed
+    entry_id, millis_time, seq_num = parsed
 
     if millis_time == 0 and seq_num == 0:
         return "-ERR The ID specified in XADD must be greater than 0-0\r\n"
 
-    with state.data_store_lock:
-        entries = state.data_store[key].stream if key in state.data_store else None
-        if entries:
-            last_ms, last_seq = map(int, entries[-1].id.split("-"))
-            if millis_time < last_ms or (millis_time == last_ms and seq_num <= last_seq):
-                return (
-                    "-ERR The ID specified in XADD is equal or smaller than"
-                    " the target stream top item\r\n"
-                )
-
-        fields = {parts[i]: parts[i + 1] for i in range(3, len(parts), 2)}
-        entry = StreamEntry(entry_id, fields)
-
-        if key not in state.data_store:
-            state.data_store[key] = StoredValue(stream=[entry])
-        elif state.data_store[key].stream is not None:
-            state.data_store[key].stream.append(entry)  # type: ignore[union-attr]
-        else:
-            return _WRONGTYPE
-
-    unblock_waiting_stream_readers(key)
-    return f"${len(entry_id)}\r\n{entry_id}\r\n"
+    fields = {parts[i]: parts[i + 1] for i in range(3, len(parts), 2)}
+    return _append_stream_entry(key, entry_id, millis_time, seq_num, fields)
 
 
 def cmd_xread(client: socket.socket, parts: List[str]) -> str:
