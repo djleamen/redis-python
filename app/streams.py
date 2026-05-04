@@ -166,6 +166,84 @@ def cmd_xadd(parts: List[str]) -> str:
     return _append_stream_entry(key, entry_id, millis_time, seq_num, fields)
 
 
+_ERR_XREAD_ARGS = "-ERR wrong number of arguments for XREAD\r\n"
+
+
+def _parse_xread_header(parts: List[str]):
+    """
+    Parse the BLOCK/STREAMS header of an XREAD command.
+
+    :returns: ``(block_timeout, streams_index)`` on success, or an error string.
+    """
+    block_timeout = -1
+    streams_index = 1
+
+    if parts[1].upper() == "BLOCK":
+        if len(parts) < 6:
+            return _ERR_XREAD_ARGS
+        try:
+            block_timeout = int(parts[2])
+            streams_index = 3
+        except ValueError:
+            return "-ERR timeout is not an integer or out of range\r\n"
+
+    if parts[streams_index].upper() != "STREAMS":
+        return _ERR_XREAD_ARGS
+
+    args_after_streams = len(parts) - streams_index - 1
+    if args_after_streams < 2 or args_after_streams % 2 != 0:
+        return _ERR_XREAD_ARGS
+
+    return block_timeout, streams_index
+
+
+def _query_streams(keys_list: List[str], ids: List[str]) -> list:
+    """Query each stream for entries strictly after the given IDs."""
+    results = []
+    for k, start_id in zip(keys_list, ids):
+        start_ms, start_seq = parse_stream_id(start_id, True)
+        with state.data_store_lock:
+            stored = state.data_store.get(k)
+            if stored is None or stored.stream is None:
+                continue
+            matches = [
+                e for e in stored.stream
+                for em, es in [map(int, e.id.split("-"))]
+                if (em, es) > (start_ms, start_seq)
+            ]
+        if matches:
+            results.append((k, matches))
+    return results
+
+
+def _block_and_wait_xread(
+    keys_list: List[str], ids: List[str], block_timeout: int
+):
+    """Register a blocking reader, wait for new stream data, and return results or None."""
+    reader = BlockedStreamReader(keys_list, ids, threading.Event(), [])
+    with state.blocked_stream_readers_lock:
+        for k in keys_list:
+            state.blocked_stream_readers.setdefault(k, deque()).append(reader)
+
+    if block_timeout > 0:
+        reader.event.wait(timeout=block_timeout / 1000.0)
+    else:
+        reader.event.wait()
+
+    with state.blocked_stream_readers_lock:
+        for k in keys_list:
+            if k in state.blocked_stream_readers:
+                new_q = deque(
+                    r for r in state.blocked_stream_readers[k] if r is not reader
+                )
+                if new_q:
+                    state.blocked_stream_readers[k] = new_q
+                else:
+                    del state.blocked_stream_readers[k]
+
+    return reader.result[0] if reader.result else None
+
+
 def cmd_xread(client: socket.socket, parts: List[str]) -> str:
     """
     Handle the XREAD command, optionally blocking until new entries arrive.
@@ -174,78 +252,22 @@ def cmd_xread(client: socket.socket, parts: List[str]) -> str:
     :param parts: Parsed RESP command tokens.
     :returns: RESP-encoded nested array of stream results, or ``*-1`` if no data.
     """
-    block_timeout = -1
-    streams_index = 1
+    parsed = _parse_xread_header(parts)
+    if isinstance(parsed, str):
+        return parsed
+    block_timeout, streams_index = parsed
 
-    if parts[1].upper() == "BLOCK":
-        if len(parts) < 6:
-            return "-ERR wrong number of arguments for XREAD\r\n"
-        try:
-            block_timeout = int(parts[2])
-            streams_index = 3
-        except ValueError:
-            return "-ERR timeout is not an integer or out of range\r\n"
-
-    if parts[streams_index].upper() != "STREAMS":
-        return "-ERR wrong number of arguments for XREAD\r\n"
-
-    args_after_streams = len(parts) - streams_index - 1
-    if args_after_streams < 2 or args_after_streams % 2 != 0:
-        return "-ERR wrong number of arguments for XREAD\r\n"
-
-    stream_count = args_after_streams // 2
+    stream_count = (len(parts) - streams_index - 1) // 2
     keys_list = [parts[streams_index + 1 + i] for i in range(stream_count)]
     ids = [
-        resolve_stream_id(
-            keys_list[i], parts[streams_index + 1 + stream_count + i])
+        resolve_stream_id(keys_list[i], parts[streams_index + 1 + stream_count + i])
         for i in range(stream_count)
     ]
 
-    def _query_streams():
-        results = []
-        for k, start_id in zip(keys_list, ids):
-            start_ms, start_seq = parse_stream_id(start_id, True)
-            with state.data_store_lock:
-                stored = state.data_store.get(k)
-                if stored is None or stored.stream is None:
-                    continue
-                matches = [
-                    e for e in stored.stream
-                    for em, es in [map(int, e.id.split("-"))]
-                    if (em, es) > (start_ms, start_seq)
-                ]
-            if matches:
-                results.append((k, matches))
-        return results
-
-    stream_results = _query_streams()
+    stream_results = _query_streams(keys_list, ids)
 
     if not stream_results and block_timeout >= 0:
-        reader = BlockedStreamReader(keys_list, ids, threading.Event(), [])
-        with state.blocked_stream_readers_lock:
-            for k in keys_list:
-                state.blocked_stream_readers.setdefault(
-                    k, deque()).append(reader)
-
-        if block_timeout > 0:
-            reader.event.wait(timeout=block_timeout / 1000.0)
-        else:
-            reader.event.wait()
-
-        with state.blocked_stream_readers_lock:
-            for k in keys_list:
-                if k in state.blocked_stream_readers:
-                    new_q = deque(
-                        r for r in state.blocked_stream_readers[k] if r is not reader)
-                    if new_q:
-                        state.blocked_stream_readers[k] = new_q
-                    else:
-                        del state.blocked_stream_readers[k]
-
-        if reader.result:
-            stream_results = reader.result[0] or []
-        else:
-            return "*-1\r\n"
+        stream_results = _block_and_wait_xread(keys_list, ids, block_timeout) or []
 
     if not stream_results:
         return "*-1\r\n"
