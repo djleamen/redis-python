@@ -30,60 +30,13 @@ def execute_command(parts: List[str]) -> str:
         return "-ERR empty command\r\n"
 
     command = parts[0].upper()
-
-    if command == "PING":
-        return "+PONG\r\n"
-
-    if command == "ECHO" and len(parts) > 1:
-        msg = parts[1]
-        return f"${len(msg)}\r\n{msg}\r\n"
-
-    if command == "SET" and len(parts) >= 3:
-        return _cmd_set(parts)
-
-    if command == "GET" and len(parts) > 1:
-        return _cmd_get(parts)
-
-    if command == "INCR" and len(parts) >= 2:
-        return _cmd_incr(parts)
-
-    if command == "ZADD" and len(parts) >= 4:
-        return _cmd_zadd(parts)
-
-    if command == "ZRANK" and len(parts) >= 3:
-        return _cmd_zrank(parts)
-
-    if command == "ZRANGE" and len(parts) >= 4:
-        return _cmd_zrange(parts)
-
-    if command == "ZCARD" and len(parts) >= 2:
-        return _cmd_zcard(parts)
-
-    if command == "ZSCORE" and len(parts) >= 3:
-        return _cmd_zscore(parts)
-
-    if command == "ZREM" and len(parts) >= 3:
-        return _cmd_zrem(parts)
-
-    if command == "GEOADD" and len(parts) >= 5:
-        return _cmd_geoadd(parts)
-
-    if command == "GEOPOS" and len(parts) >= 3:
-        return _cmd_geopos(parts)
-
-    if command == "GEODIST" and len(parts) >= 4:
-        return _cmd_geodist(parts)
-
-    if command == "GEOSEARCH" and len(parts) >= 8:
-        return _cmd_geosearch(parts)
-
-    if command == "AUTH" and len(parts) >= 3:
-        return _cmd_auth(parts)
-
-    if command == "ACL" and len(parts) >= 2:
-        return _cmd_acl(parts)
-
-    return "-ERR unknown command\r\n"
+    entry = _COMMAND_DISPATCH.get(command)
+    if entry is None:
+        return "-ERR unknown command\r\n"
+    handler, min_parts = entry
+    if len(parts) < min_parts:
+        return "-ERR unknown command\r\n"
+    return handler(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -503,3 +456,42 @@ def _cmd_geosearch(parts: List[str]) -> str:
     for m in matches:
         resp.append(f"${len(m)}\r\n{m}\r\n")
     return "".join(resp)
+
+
+# ---------------------------------------------------------------------------
+# Simple inline command helpers
+# ---------------------------------------------------------------------------
+
+
+def _cmd_ping(_parts: List[str]) -> str:
+    return "+PONG\r\n"
+
+
+def _cmd_echo(parts: List[str]) -> str:
+    msg = parts[1]
+    return f"${len(msg)}\r\n{msg}\r\n"
+
+
+# ---------------------------------------------------------------------------
+# Dispatch table  (defined after all handlers so names are already bound)
+# ---------------------------------------------------------------------------
+
+_COMMAND_DISPATCH = {
+    "PING":      (_cmd_ping,      1),
+    "ECHO":      (_cmd_echo,      2),
+    "SET":       (_cmd_set,       3),
+    "GET":       (_cmd_get,       2),
+    "INCR":      (_cmd_incr,      2),
+    "ZADD":      (_cmd_zadd,      4),
+    "ZRANK":     (_cmd_zrank,     3),
+    "ZRANGE":    (_cmd_zrange,    4),
+    "ZCARD":     (_cmd_zcard,     2),
+    "ZSCORE":    (_cmd_zscore,    3),
+    "ZREM":      (_cmd_zrem,      3),
+    "GEOADD":    (_cmd_geoadd,    5),
+    "GEOPOS":    (_cmd_geopos,    3),
+    "GEODIST":   (_cmd_geodist,   4),
+    "GEOSEARCH": (_cmd_geosearch, 8),
+    "AUTH":      (_cmd_auth,      3),
+    "ACL":       (_cmd_acl,       2),
+}
