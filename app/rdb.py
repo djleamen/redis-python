@@ -62,6 +62,18 @@ def read_string(data: bytes, offset: int) -> Tuple[str, int]:
     return string, length_bytes + length
 
 
+def _handle_plain_value(data: bytes, offset: int, opcode: int) -> Tuple[int, bool]:
+    key, kb = read_string(data, offset)
+    offset += kb
+    if opcode != 0:
+        return offset, True
+    value, vb = read_string(data, offset)
+    offset += vb
+    with state.data_store_lock:
+        state.data_store[key] = StoredValue(value=value)
+    return offset, False
+
+
 def load_rdb_file(file_path: str) -> None:
     """
     Populate the global data store from an RDB file.
@@ -128,15 +140,9 @@ def load_rdb_file(file_path: str) -> None:
                 offset += vb
 
             else:
-                key, kb = read_string(data, offset)
-                offset += kb
-                if opcode == 0:
-                    value, vb = read_string(data, offset)
-                    offset += vb
-                    with state.data_store_lock:
-                        state.data_store[key] = StoredValue(value=value)
-                else:
+                offset, should_break = _handle_plain_value(data, offset, opcode)
+                if should_break:
                     break
 
-    except (IOError, struct.error, ValueError, UnicodeDecodeError):
+    except (IOError, struct.error, ValueError):
         pass
