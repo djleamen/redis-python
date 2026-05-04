@@ -130,9 +130,12 @@ def _cmd_auth(parts: List[str]) -> str:
     return "-WRONGPASS invalid username-password pair or user is disabled.\r\n"
 
 
+_ERR_UNKNOWN_ACL_SUBCMD = "-ERR unknown ACL subcommand\r\n"
+
+
 def _cmd_acl_setuser(parts: List[str]) -> str:
     if len(parts) < 3:
-        return "-ERR unknown ACL subcommand\r\n"
+        return _ERR_UNKNOWN_ACL_SUBCMD
     if parts[2] != "default":
         return "-ERR unknown user\r\n"
     for rule in parts[3:]:
@@ -146,7 +149,7 @@ def _cmd_acl_setuser(parts: List[str]) -> str:
 
 def _cmd_acl_getuser(parts: List[str]) -> str:
     if len(parts) < 3:
-        return "-ERR unknown ACL subcommand\r\n"
+        return _ERR_UNKNOWN_ACL_SUBCMD
     if parts[2] != "default":
         return "$-1\r\n"
     flags = list(state.default_user_flags)
@@ -175,7 +178,7 @@ def _cmd_acl(parts: List[str]) -> str:
     }
     handler = _ACL_SUBCOMMANDS.get(sub)
     if handler is None:
-        return "-ERR unknown ACL subcommand\r\n"
+        return _ERR_UNKNOWN_ACL_SUBCMD
     return handler(parts)
 
 
