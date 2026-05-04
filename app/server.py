@@ -8,7 +8,7 @@ import socket
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 
 from . import state
 from .commands import execute_command
@@ -28,7 +28,8 @@ from .utils import get_current_time_ms, parse_args
 
 _WRONGTYPE = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
 _WRONGPASS = "-WRONGPASS invalid username-password pair or user is disabled.\r\n"
-_WRITE_CMDS = {"SET", "INCR", "ZADD", "ZREM", "GEOADD", "XADD", "RPUSH", "LPUSH"}
+_WRITE_CMDS = {"SET", "INCR", "ZADD", "ZREM",
+               "GEOADD", "XADD", "RPUSH", "LPUSH"}
 _EXECUTE_CMDS = {
     "PING", "ECHO", "GET", "INCR",
     "ACL",
@@ -50,7 +51,8 @@ class _ClientCtx:
     watched_keys: set = field(default_factory=set)
     is_replication_connection: bool = False
     is_subscribed_mode: bool = False
-    is_authenticated: bool = field(default_factory=lambda: "nopass" in state.default_user_flags)
+    is_authenticated: bool = field(
+        default_factory=lambda: "nopass" in state.default_user_flags)
 
 
 def _notify_key_modified(key: str, modifier: socket.socket) -> None:
@@ -208,10 +210,9 @@ def _handle_replconf(ctx: "_ClientCtx", parts: List[str]) -> str:
     return "+OK\r\n"
 
 
-def _dispatch_command(ctx: "_ClientCtx", parts: List[str], input_str: str) -> str:
-    """Route a single command to the appropriate handler; return RESP response."""
-    command = parts[0].upper()
-
+def _dispatch_transaction_cmds(
+    ctx: "_ClientCtx", parts: List[str], command: str
+) -> Optional[str]:
     if command == "MULTI":
         return _handle_multi(ctx)
     if command == "EXEC":
@@ -223,9 +224,12 @@ def _dispatch_command(ctx: "_ClientCtx", parts: List[str], input_str: str) -> st
     if command == "UNWATCH":
         _clear_watch_state(ctx.client, ctx.watched_keys)
         return "+OK\r\n"
-    if ctx.in_transaction:
-        ctx.transaction_queue.append(parts)
-        return "+QUEUED\r\n"
+    return None
+
+
+def _dispatch_info_cmds(
+    ctx: "_ClientCtx", parts: List[str], command: str
+) -> Optional[str]:
     if command == "PING" and ctx.is_subscribed_mode:
         return "*2\r\n$4\r\npong\r\n$0\r\n\r\n"
     if command == "AUTH" and len(parts) >= 3:
@@ -236,6 +240,20 @@ def _dispatch_command(ctx: "_ClientCtx", parts: List[str], input_str: str) -> st
         return _handle_config_get(parts)
     if command == "KEYS" and len(parts) >= 2:
         return _handle_keys(parts)
+    return None
+
+
+def _handle_execute_cmd(ctx: "_ClientCtx", parts: List[str]) -> str:
+    command = parts[0].upper()
+    response = execute_command(parts)
+    if command in _NOTIFY_CMDS and len(parts) >= 2:
+        _notify_key_modified(parts[1], ctx.client)
+    return response
+
+
+def _dispatch_replication_cmds(
+    ctx: "_ClientCtx", parts: List[str], command: str, input_str: str
+) -> Optional[str]:
     if command == "REPLCONF":
         return _handle_replconf(ctx, parts)
     if command == "PSYNC" and len(parts) >= 3:
@@ -253,11 +271,14 @@ def _dispatch_command(ctx: "_ClientCtx", parts: List[str], input_str: str) -> st
             if state.appendonly.lower() == "yes":
                 append_to_aof(parts)
         return response
-    if command in _EXECUTE_CMDS:
-        response = execute_command(parts)
-        if command in _NOTIFY_CMDS and len(parts) >= 2:
-            _notify_key_modified(parts[1], ctx.client)
-        return response
+    if command == "WAIT" and len(parts) >= 3:
+        return _cmd_wait(parts)
+    return None
+
+
+def _dispatch_list_cmds(
+    ctx: "_ClientCtx", parts: List[str], command: str
+) -> Optional[str]:
     if command == "RPUSH" and len(parts) >= 3:
         _notify_key_modified(parts[1], ctx.client)
         return cmd_rpush(parts)
@@ -274,10 +295,12 @@ def _dispatch_command(ctx: "_ClientCtx", parts: List[str], input_str: str) -> st
         return cmd_blpop(ctx.client, parts)
     if command == "TYPE" and len(parts) >= 2:
         return _cmd_type(parts)
-    if command == "WAIT" and len(parts) >= 3:
-        return _cmd_wait(parts)
-    if command == "PUBLISH" and len(parts) >= 3:
-        return cmd_publish(parts)
+    return None
+
+
+def _dispatch_pubsub_stream_cmds(
+    ctx: "_ClientCtx", parts: List[str], command: str
+) -> Optional[str]:
     if command == "SUBSCRIBE" and len(parts) >= 2:
         cmd_subscribe(ctx.client, parts)
         ctx.is_subscribed_mode = True
@@ -285,6 +308,8 @@ def _dispatch_command(ctx: "_ClientCtx", parts: List[str], input_str: str) -> st
     if command == "UNSUBSCRIBE" and len(parts) >= 2:
         ctx.is_subscribed_mode = cmd_unsubscribe(ctx.client, parts)
         return ""
+    if command == "PUBLISH" and len(parts) >= 3:
+        return cmd_publish(parts)
     if command == "XADD" and len(parts) >= 4:
         response = cmd_xadd(parts)
         if not response.startswith("-"):
@@ -294,6 +319,32 @@ def _dispatch_command(ctx: "_ClientCtx", parts: List[str], input_str: str) -> st
         return cmd_xread(ctx.client, parts)
     if command == "XRANGE" and len(parts) >= 4:
         return cmd_xrange(parts)
+    return None
+
+
+def _dispatch_command(ctx: "_ClientCtx", parts: List[str], input_str: str) -> str:
+    """Route a single command to the appropriate handler; return RESP response."""
+    command = parts[0].upper()
+    result = _dispatch_transaction_cmds(ctx, parts, command)
+    if result is not None:
+        return result
+    if ctx.in_transaction:
+        ctx.transaction_queue.append(parts)
+        return "+QUEUED\r\n"
+    result = _dispatch_info_cmds(ctx, parts, command)
+    if result is not None:
+        return result
+    result = _dispatch_replication_cmds(ctx, parts, command, input_str)
+    if result is not None:
+        return result
+    if command in _EXECUTE_CMDS:
+        return _handle_execute_cmd(ctx, parts)
+    result = _dispatch_list_cmds(ctx, parts, command)
+    if result is not None:
+        return result
+    result = _dispatch_pubsub_stream_cmds(ctx, parts, command)
+    if result is not None:
+        return result
     return "-ERR unknown command\r\n"
 
 
