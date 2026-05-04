@@ -4,7 +4,7 @@ Master-replica replication: handshake, command propagation, and forwarding.
 
 import base64
 import socket
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from . import state
 from .models import StoredValue
@@ -29,7 +29,7 @@ def propagate_to_replicas(command: str) -> None:
         for replica in state.replica_connections:
             try:
                 replica.send(command_bytes)
-            except (socket.error, BrokenPipeError, OSError):
+            except OSError:
                 disconnected.append(replica)
 
         for replica in disconnected:
@@ -52,7 +52,7 @@ def request_replica_acks(replicas: List[socket.socket]) -> None:
         for replica in replicas:
             try:
                 replica.send(getack)
-            except (socket.error, BrokenPipeError, OSError):
+            except OSError:
                 disconnected.append(replica)
 
         for replica in disconnected:
@@ -144,6 +144,57 @@ def process_buffered_commands(command_buffer: List[str], stream: socket.socket) 
         command_buffer.append(buffered[processed:])
 
 
+def _do_handshake(sock: socket.socket, port_str: str) -> None:
+    for cmd in [
+        b"*1\r\n$4\r\nPING\r\n",
+        (
+            f"*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n"
+            f"${len(port_str)}\r\n{port_str}\r\n"
+        ).encode(),
+        b"*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n",
+    ]:
+        sock.send(cmd)
+        sock.recv(4096)
+
+
+def _receive_rdb(
+    sock: socket.socket, buf: bytes, text: str, rdb_start: int
+) -> Tuple[bytes, int]:
+    """
+    Receive the full RDB payload from the master.
+
+    :returns: ``(buf, rdb_data_end)`` after the complete RDB dump has arrived.
+    :raises ValueError: When the connection closes before the payload is complete.
+    """
+    while rdb_start >= len(text) or text[rdb_start] != "$":
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise ValueError
+        buf += chunk
+        text = buf.decode("utf-8", errors="ignore")
+
+    rdb_len_end = text.find("\r\n", rdb_start)
+    while rdb_len_end == -1:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise ValueError
+        buf += chunk
+        text = buf.decode("utf-8", errors="ignore")
+        rdb_len_end = text.find("\r\n", rdb_start)
+
+    rdb_length = int(text[rdb_start + 1 : rdb_len_end])
+    rdb_data_start = len(text[:rdb_len_end].encode("utf-8")) + 2
+    rdb_data_end = rdb_data_start + rdb_length
+
+    while len(buf) < rdb_data_end:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise ValueError
+        buf += chunk
+
+    return buf, rdb_data_end
+
+
 def connect_to_master(host: str, master_port: int, replica_port: int) -> None:
     """
     Connect to the master, complete the PSYNC handshake, and stream commands.
@@ -158,17 +209,7 @@ def connect_to_master(host: str, master_port: int, replica_port: int) -> None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.connect((host, master_port))
 
-        port_str = str(replica_port)
-        for cmd in [
-            b"*1\r\n$4\r\nPING\r\n",
-            (
-                f"*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n"
-                f"${len(port_str)}\r\n{port_str}\r\n"
-            ).encode(),
-            b"*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n",
-        ]:
-            sock.send(cmd)
-            sock.recv(4096)
+        _do_handshake(sock, str(replica_port))
 
         sock.send(b"*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n")
         buf = sock.recv(4096)
@@ -178,36 +219,7 @@ def connect_to_master(host: str, master_port: int, replica_port: int) -> None:
         if end == -1:
             return
 
-        rdb_start = end + 2
-        while rdb_start >= len(text) or text[rdb_start] != "$":
-            chunk = sock.recv(4096)
-            if not chunk:
-                return
-            buf += chunk
-            text = buf.decode("utf-8", errors="ignore")
-
-        rdb_len_end = text.find("\r\n", rdb_start)
-        while rdb_len_end == -1:
-            chunk = sock.recv(4096)
-            if not chunk:
-                return
-            buf += chunk
-            text = buf.decode("utf-8", errors="ignore")
-            rdb_len_end = text.find("\r\n", rdb_start)
-
-        try:
-            rdb_length = int(text[rdb_start + 1 : rdb_len_end])
-        except ValueError:
-            return
-
-        rdb_data_start = len(text[:rdb_len_end].encode("utf-8")) + 2
-        rdb_data_end = rdb_data_start + rdb_length
-
-        while len(buf) < rdb_data_end:
-            chunk = sock.recv(4096)
-            if not chunk:
-                return
-            buf += chunk
+        buf, rdb_data_end = _receive_rdb(sock, buf, text, end + 2)
 
         command_buffer: List[str] = []
         if len(buf) > rdb_data_end:
@@ -223,5 +235,5 @@ def connect_to_master(host: str, master_port: int, replica_port: int) -> None:
             command_buffer.append(data.decode("utf-8", errors="ignore"))
             process_buffered_commands(command_buffer, sock)
 
-    except (socket.error, ConnectionRefusedError, TimeoutError, OSError):
+    except (OSError, ValueError):
         pass
