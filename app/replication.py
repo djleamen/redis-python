@@ -8,7 +8,7 @@ from typing import List, Optional, Tuple
 
 from . import state
 from .models import StoredValue
-from .protocol import try_parse_resp_command
+from .protocol import RespProtocolError, try_parse_resp_command
 from .utils import get_current_time_ms
 
 _EMPTY_RDB_B64 = "UkVESVMwMDA5/2NhMOXkSGD0"
@@ -133,7 +133,12 @@ def process_buffered_commands(command_buffer: List[str], stream: socket.socket) 
         remaining = buffered[processed:]
         if not remaining:
             break
-        parts, length = try_parse_resp_command(remaining)
+        try:
+            parts, length = try_parse_resp_command(remaining)
+        except RespProtocolError:
+            # Unrecoverable garbage from the master: drop the buffer.
+            processed = len(buffered)
+            break
         if parts is None or length == 0:
             break
         process_replicated_command(parts, stream, length)

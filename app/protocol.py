@@ -5,6 +5,10 @@ Utilities for parsing the Redis Serialization Protocol (RESP).
 from typing import List, Optional, Tuple
 
 
+class RespProtocolError(Exception):
+    """Raised when buffered data can never become a valid RESP command."""
+
+
 def parse_resp_array(input_str: str) -> List[str]:
     """
     Parse a RESP array from a raw input string.
@@ -41,22 +45,36 @@ def _parse_bulk_element(
     :param lines: All lines from the raw data buffer split on ``\\r\\n``.
     :param line_index: Index of the ``$<length>`` line for this element.
     :returns: ``(value, next_line_index, bytes_consumed)``
-    :raises ValueError: When the element is incomplete or malformed.
+    :raises ValueError: When the element is incomplete (more data may arrive).
+    :raises RespProtocolError: When the element is malformed beyond repair.
     """
     if line_index >= len(lines):
         raise ValueError
     length_line = lines[line_index]
+    # Lines other than the last are terminated by \r\n, so they can no
+    # longer change as more data arrives: reject them outright if invalid.
+    line_is_terminated = line_index < len(lines) - 1
     if not length_line.startswith("$"):
+        if line_is_terminated:
+            raise RespProtocolError
         raise ValueError
-    bulk_length = int(length_line[1:])
+    try:
+        bulk_length = int(length_line[1:])
+    except ValueError:
+        if line_is_terminated:
+            raise RespProtocolError from None
+        raise
+    if bulk_length < 0:
+        raise RespProtocolError
     line_index += 1
     if line_index >= len(lines):
         raise ValueError
     value = lines[line_index]
-    if len(value) != bulk_length and (
-        line_index == len(lines) - 1
-        or (line_index == len(lines) - 2 and lines[line_index + 1] == "")
-    ):
+    if len(value) != bulk_length:
+        if line_index < len(lines) - 1:
+            # The value line is terminated, so it can never grow to match
+            # its declared length: the stream is corrupt.
+            raise RespProtocolError
         raise ValueError
     return value, line_index + 1, len(length_line) + 2 + len(value) + 2
 
@@ -68,6 +86,8 @@ def try_parse_resp_command(data: str) -> Tuple[Optional[List[str]], int]:
     :param data: Accumulated raw data string from the socket buffer.
     :returns: ``(parsed_parts, bytes_consumed)``, or ``(None, 0)`` when no
         complete command is available yet.
+    :raises RespProtocolError: When the buffered data is malformed and can
+        never become a valid command no matter how much more data arrives.
     """
     if not data or not data.startswith("*"):
         return None, 0
@@ -79,7 +99,10 @@ def try_parse_resp_command(data: str) -> Tuple[Optional[List[str]], int]:
     try:
         array_length = int(lines[0][1:])
     except ValueError:
-        return None, 0
+        # The header line is already terminated by \r\n, so it is garbage.
+        raise RespProtocolError from None
+    if array_length < 0:
+        raise RespProtocolError
 
     parts: List[str] = []
     line_index = 1

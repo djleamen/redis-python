@@ -7,7 +7,7 @@ from typing import List
 
 from . import state
 from .commands import execute_command
-from .protocol import try_parse_resp_command
+from .protocol import RespProtocolError, try_parse_resp_command
 
 
 def append_to_aof(parts: List[str]) -> None:
@@ -44,7 +44,10 @@ def replay_aof(path: str) -> None:
         return
     offset = 0
     while offset < len(raw):
-        cmd_parts, consumed = try_parse_resp_command(raw[offset:])
+        try:
+            cmd_parts, consumed = try_parse_resp_command(raw[offset:])
+        except RespProtocolError:
+            break
         if consumed == 0:
             break
         offset += consumed

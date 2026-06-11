@@ -14,7 +14,7 @@ from . import state
 from .commands import execute_command
 from .lists import cmd_rpush, cmd_lpush, cmd_lrange, cmd_llen, cmd_lpop, cmd_blpop
 from .persistence import append_to_aof, replay_aof
-from .protocol import parse_resp_array
+from .protocol import RespProtocolError, try_parse_resp_command
 from .pubsub import cmd_publish, cmd_subscribe, cmd_unsubscribe
 from .rdb import load_rdb_file
 from .replication import (
@@ -46,6 +46,7 @@ _SUBSCRIBED_ALLOWED = {
 @dataclass
 class _ClientCtx:
     client: socket.socket
+    recv_buffer: str = ""
     in_transaction: bool = False
     transaction_queue: List[List[str]] = field(default_factory=list)
     watched_keys: set = field(default_factory=set)
@@ -257,7 +258,7 @@ def _dispatch_replication_cmds(
     if command == "REPLCONF":
         return _handle_replconf(ctx, parts)
     if command == "PSYNC" and len(parts) >= 3:
-        ctx.client.send(build_fullresync_payload())
+        ctx.client.sendall(build_fullresync_payload())
         with state.replica_connections_lock:
             state.replica_connections.append(ctx.client)
             state.replica_ack_offsets[ctx.client] = 0
@@ -265,7 +266,7 @@ def _dispatch_replication_cmds(
         return ""
     if command == "SET" and len(parts) >= 3:
         response = execute_command(parts)
-        if not ctx.is_replication_connection:
+        if not ctx.is_replication_connection and response == "+OK\r\n":
             propagate_to_replicas(input_str)
             _notify_key_modified(parts[1], ctx.client)
             if state.appendonly.lower() == "yes":
@@ -348,32 +349,56 @@ def _dispatch_command(ctx: "_ClientCtx", parts: List[str], input_str: str) -> st
     return "-ERR unknown command\r\n"
 
 
+def _handle_parsed_command(ctx: "_ClientCtx", parts: List[str], input_str: str) -> None:
+    """Apply auth/subscribe-mode checks, dispatch one command, send the reply."""
+    command = parts[0].upper()
+    if ctx.is_subscribed_mode and command not in _SUBSCRIBED_ALLOWED:
+        ctx.client.sendall(
+            f"-ERR Can't execute '{command.lower()}': only (P|S)SUBSCRIBE / "
+            f"(P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed "
+            f"in this context\r\n".encode("utf-8")
+        )
+        return
+    if not ctx.is_authenticated and command not in {"AUTH", "HELLO", "QUIT", "RESET"}:
+        ctx.client.sendall(b"-NOAUTH Authentication required.\r\n")
+        return
+    try:
+        response = _dispatch_command(ctx, parts, input_str)
+    except Exception:  # noqa: BLE001 - a handler bug must never kill the thread
+        response = "-ERR internal error\r\n"
+    if response and not ctx.is_replication_connection:
+        ctx.client.sendall(response.encode("utf-8"))
+
+
 def _process_client_message(ctx: "_ClientCtx", buf: bytes) -> bool:
     """
-    Parse and dispatch one message buffer from a client.
+    Buffer incoming bytes and dispatch every complete command they contain.
+
+    Commands may arrive split across several ``recv`` calls or batched
+    (pipelined) inside a single one; ``ctx.recv_buffer`` bridges the gap.
 
     :returns: False if the connection should be closed, True otherwise.
     """
     if not buf:
         return False
-    input_str = buf.decode("utf-8")
-    parts = parse_resp_array(input_str)
-    if not parts:
-        return True
-    command = parts[0].upper()
-    if ctx.is_subscribed_mode and command not in _SUBSCRIBED_ALLOWED:
-        ctx.client.send(
-            f"-ERR Can't execute '{command.lower()}': only (P|S)SUBSCRIBE / "
-            f"(P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed "
-            f"in this context\r\n".encode("utf-8")
-        )
-        return True
-    if not ctx.is_authenticated and command not in {"AUTH", "HELLO", "QUIT", "RESET"}:
-        ctx.client.send(b"-NOAUTH Authentication required.\r\n")
-        return True
-    response = _dispatch_command(ctx, parts, input_str)
-    if response and not ctx.is_replication_connection:
-        ctx.client.send(response.encode("utf-8"))
+    ctx.recv_buffer += buf.decode("utf-8", errors="replace")
+    while ctx.recv_buffer:
+        if not ctx.recv_buffer.startswith("*"):
+            # Not a RESP array (inline commands are unsupported): drop it
+            # so garbage cannot wedge the connection.
+            ctx.recv_buffer = ""
+            break
+        try:
+            parts, consumed = try_parse_resp_command(ctx.recv_buffer)
+        except RespProtocolError:
+            ctx.client.sendall(b"-ERR Protocol error\r\n")
+            return False
+        if parts is None or consumed == 0:
+            break  # Incomplete command: wait for more data.
+        input_str = ctx.recv_buffer[:consumed]
+        ctx.recv_buffer = ctx.recv_buffer[consumed:]
+        if parts:
+            _handle_parsed_command(ctx, parts, input_str)
     return True
 
 
