@@ -70,10 +70,11 @@ def _parse_bulk_element(
     if line_index >= len(lines):
         raise ValueError
     value = lines[line_index]
-    if len(value) != bulk_length and (
-        line_index == len(lines) - 1
-        or (line_index == len(lines) - 2 and lines[line_index + 1] == "")
-    ):
+    if len(value) != bulk_length:
+        if line_index < len(lines) - 1:
+            # The value line is terminated, so it can never grow to match
+            # its declared length: the stream is corrupt.
+            raise RespProtocolError
         raise ValueError
     return value, line_index + 1, len(length_line) + 2 + len(value) + 2
 
@@ -100,6 +101,8 @@ def try_parse_resp_command(data: str) -> Tuple[Optional[List[str]], int]:
     except ValueError:
         # The header line is already terminated by \r\n, so it is garbage.
         raise RespProtocolError from None
+    if array_length < 0:
+        raise RespProtocolError
 
     parts: List[str] = []
     line_index = 1

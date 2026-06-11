@@ -258,7 +258,7 @@ def _dispatch_replication_cmds(
     if command == "REPLCONF":
         return _handle_replconf(ctx, parts)
     if command == "PSYNC" and len(parts) >= 3:
-        ctx.client.send(build_fullresync_payload())
+        ctx.client.sendall(build_fullresync_payload())
         with state.replica_connections_lock:
             state.replica_connections.append(ctx.client)
             state.replica_ack_offsets[ctx.client] = 0
