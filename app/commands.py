@@ -51,11 +51,14 @@ def _cmd_set(parts: List[str]) -> str:
     i = 3
     while i < len(parts) - 1:
         opt = parts[i].upper()
-        if opt == "PX":
-            expiry_ms = get_current_time_ms() + int(parts[i + 1])
-            break
-        elif opt == "EX":
-            expiry_ms = get_current_time_ms() + int(parts[i + 1]) * 1000
+        if opt in ("PX", "EX"):
+            try:
+                amount = int(parts[i + 1])
+            except ValueError:
+                return "-ERR value is not an integer or out of range\r\n"
+            expiry_ms = get_current_time_ms() + (
+                amount if opt == "PX" else amount * 1000
+            )
             break
         i += 1
     with state.data_store_lock:
